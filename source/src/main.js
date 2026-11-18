@@ -160,20 +160,27 @@ let D;
 {
   const prims = primBuffer();
   const m = mod(W_DENS), p = device.createComputePipeline({ layout: 'auto', compute: { module: m, entryPoint: 'main' } });
-  const size = NX * NY * NZ * 4;
+  // Computed in slabs of SZ z-slices, one submit each, waiting for each to finish: phone GPUs reset the device when a
+  // single job runs too long, and the whole volume at once (21M samples) is close to that limit
+  const SZ = 16, slab = NX * NY * SZ * 4;
   const u = new ArrayBuffer(48), uu = new Uint32Array(u), uf = new Float32Array(u);
   uu[0] = NX; uu[1] = NY; uu[2] = NZ; uf[4] = OX; uf[5] = OY; uf[6] = OZ; uf[7] = VS;
   uu[8] = MESAS.length; uu[9] = ARCHES.length; uu[10] = HOLES.length; uu[11] = CLEARS.length;
-  const bu = buf(new Uint8Array(u), BU.UNIFORM), bp = buf(prims, BU.STORAGE);
-  const bd = device.createBuffer({ size, usage: BU.STORAGE | BU.COPY_SRC }), br = device.createBuffer({ size, usage: BU.MAP_READ | BU.COPY_DST });
+  const bu = device.createBuffer({ size: 48, usage: BU.UNIFORM | BU.COPY_DST }), bp = buf(prims, BU.STORAGE);
+  const bd = device.createBuffer({ size: slab, usage: BU.STORAGE | BU.COPY_SRC }), br = device.createBuffer({ size: slab, usage: BU.MAP_READ | BU.COPY_DST });
   const bg = device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: bu } }, { binding: 1, resource: { buffer: bd } }, { binding: 2, resource: { buffer: bp } }] });
-  const e = device.createCommandEncoder(), c = e.beginComputePass();
-  c.setPipeline(p); c.setBindGroup(0, bg); c.dispatchWorkgroups(NX / 4, NY / 4, NZ / 4); c.end();
-  e.copyBufferToBuffer(bd, 0, br, 0, size);
-  Q.submit([e.finish()]);
-  await br.mapAsync(GPUMapMode.READ);
-  D = new Float32Array(br.getMappedRange().slice(0));
-  br.unmap(); br.destroy(); bd.destroy();
+  D = new Float32Array(NX * NY * NZ);
+  for (let z = 0; z < NZ; z += SZ) {
+    uu[3] = z; Q.writeBuffer(bu, 0, u); // first z-slice of this slab
+    const e = device.createCommandEncoder(), c = e.beginComputePass();
+    c.setPipeline(p); c.setBindGroup(0, bg); c.dispatchWorkgroups(NX / 4, NY / 4, SZ / 4); c.end();
+    e.copyBufferToBuffer(bd, 0, br, 0, slab);
+    Q.submit([e.finish()]);
+    await br.mapAsync(GPUMapMode.READ);
+    D.set(new Float32Array(br.getMappedRange()), z * NX * NY);
+    br.unmap();
+  }
+  br.destroy(); bd.destroy(); bu.destroy(); bp.destroy();
   // rock connected to the seabed: each column's unbroken run up from the bottom is, and the rock above a gap
   // (overhangs, specks) is when it touches rock that is. What never connects is a speck of noise floating in
   // the water (surface nets would make it a small box), so it becomes water
