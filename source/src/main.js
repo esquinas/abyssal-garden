@@ -17,16 +17,26 @@ const say = (m, to, ms) => {
 };
 const fail = (m) => { throw new Error(m, { cause: 1 }); }; // cause marks a message that is shown as it is
 if (!navigator.gpu) fail('This scene needs WebGPU. Try a current Chrome or Edge.');
-const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-if (!adapter) fail('No WebGPU adapter found.');
+// Right after a reload or a graphics crash the browser can refuse an adapter for a few seconds: ask again, waiting
+// longer each time, and from the third try without asking for the faster chip (some phone drivers refuse that)
+let adapter = null;
+for (let i = 0; i < 7 && !adapter; i++) {
+  if (i) { $('s').textContent = 'Waiting for the graphics chip…'; await new Promise((r) => setTimeout(r, [300, 600, 1e3, 2e3, 3e3, 5e3][i - 1])); }
+  adapter = await navigator.gpu.requestAdapter(i < 2 ? { powerPreference: 'high-performance' } : {});
+}
+if (!adapter) fail("The browser isn't letting this page use the graphics chip right now. This can happen after a crash. Close this tab and open the page again, or restart the browser.");
 $('w').hidden = !!navigator.userAgentData; // only Chromium-based browsers have it
 const hasTS = adapter.features.has('timestamp-query');
 const device = await adapter.requestDevice({ requiredFeatures: hasTS ? ['timestamp-query'] : [] });
 device.addEventListener('uncapturederror', (e) => console.error('GPU: ' + e.error.message));
-// out of memory or a GPU timeout: reload a level lower, or on Low say what happened
+// Restarts the page (at level lv, if given) after releasing the GPU, so the next page finds the memory free.
+// `leaving` stops the device loss this causes from being taken for a crash.
+let leaving = 0;
+const restart = (lv) => { leaving = 1; if (lv != null) keep('abyssal', lv); device.destroy(); setTimeout(() => location.reload(), 150); };
+// out of memory or a GPU timeout: restart a level lower, or on Low say what happened
 device.lost.then((l) => {
-  if (l.reason === 'destroyed') return; // the page is closing
-  if (LV < 2) { keep('abyssal', LV + 1); location.reload(); }
+  if (leaving || l.reason === 'destroyed') return; // the page is closing or restarting
+  if (LV < 2) return restart(LV + 1);
   dead = body.className = 'l e'; $('s').textContent = 'The graphics device was lost. Reload the page to try again.';
 });
 const ctx = canvas.getContext('webgpu'), FMT = navigator.gpu.getPreferredCanvasFormat();
@@ -144,7 +154,8 @@ const SUN = (() => { const v = [0.27, 1, -0.24], l = hypot(...v); return v.map((
 await say('Sculpting the seabed…', 0.25, 1200);
 // marks a load in progress (quality.js); leaving the page before it ends is not a crash
 keep('abyssalLoad', 1);
-addEventListener('pagehide', () => keep('abyssalLoad', ''));
+addEventListener('pagehide', () => { keep('abyssalLoad', ''); leaving = 1; device.destroy(); });
+addEventListener('pageshow', (e) => e.persisted && location.reload()); // back from the page cache with no device
 let D;
 {
   const prims = primBuffer();
@@ -529,6 +540,7 @@ function collide() {
 }
 
 function frame(now) {
+  if (leaving) return; // the device is gone
   requestAnimationFrame(frame);
   const dtr = now - F[LAST]; F[LAST] = now;
   let dt = dtr / 1000; if (dt > 0.1) dt = 0.1;
@@ -658,7 +670,7 @@ const go = () => {
 bDive.onclick = go; $('o').onclick = () => ui(true);
 if (mob) root.className = 't';
 // detail buttons: the current level is lit, the others reload the page with theirs
-$('q').querySelectorAll('button').forEach((b, i) => { if (i === 2 - LV) b.className = 'on'; else b.onclick = () => { keep('abyssal', 2 - i); location.reload(); }; });
+$('q').querySelectorAll('button').forEach((b, i) => { if (i === 2 - LV) b.className = 'on'; else b.onclick = () => restart(2 - i); });
 document.addEventListener('pointerlockchange', () => ui(!document.pointerLockElement));
 
 // draw the first frame and wait for the GPU to finish it (pipelines get compiled on first use) before the reveal

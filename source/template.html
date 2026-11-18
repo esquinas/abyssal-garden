@@ -60,6 +60,8 @@ p { margin: 0; }
   transform: scaleX(0); transform-origin: 0; will-change: transform;
 }
 .e #p { visibility: hidden; }
+#r { display: none; margin: 1.2em auto 0; }
+.e #r { display: flex; }
 .e #s { font-size: 1.1em; letter-spacing: 0; text-transform: none; }
 
 /* buttons */
@@ -146,7 +148,7 @@ svg { width: 1.5em; height: 1.5em; fill: currentColor; }
 <div id=m>
   <h1>Abyssal Garden</h1>
   <div id=a>
-    <div id=l><div id=p><i id=b></i></div><p id=s>Diving…</p><p id=w hidden>Use Google Chrome for optimal experience</p></div>
+    <div id=l><div id=p><i id=b></i></div><p id=s>Diving…</p><button id=r onclick=location.reload()>Try again</button><p id=w hidden>Use Google Chrome for optimal experience</p></div>
     <div id=g>
       <button id=d>Dive in</button>
       <p id=q><span>Detail</span><button>Low</button><button>Medium</button><button>High</button></p>
