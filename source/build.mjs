@@ -16,8 +16,9 @@ if (dev) FILES.push('dev.js');
 
 let js = FILES.map((f) => readFileSync(path.join(here, 'src', f), 'utf8')).join('\n');
 const tpl = readFileSync(path.join(here, 'template.html'), 'utf8');
-// everything runs inside one async function; startup errors are shown on screen
-const wrap = (body) => `(async()=>{${body}\n})().catch(e=>{console.error(e);document.body.className='l e';document.getElementById('s').textContent=(e.cause?'':'Failed to start: ')+e.message});`;
+// everything runs inside one async function; startup errors are shown on screen, unless the page is already
+// restarting or showing why the graphics device was lost (data-q)
+const wrap = (body) => `(async()=>{${body}\n})().catch(e=>{console.error(e);if(document.body.dataset.q)return;document.body.className='l e';document.getElementById('s').textContent=(e.cause?'':'Failed to start: ')+e.message});`;
 
 let html;
 if (readable) {
