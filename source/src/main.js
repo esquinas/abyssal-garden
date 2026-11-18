@@ -389,7 +389,7 @@ if (hasTS) {
 
 // ---------------------------------------------------------------- frame
 let hud = false;
-let kf = 0, kb = 0, kl = 0, kr = 0, ku = 0, kd = 0, ks = 0, mdx = 0, mdy = 0, lkx = 0, lky = 0, l2x = 0, l2y = 0, hN = 0, hMax = 0, hMin = 1e9, hPer = 1e9, hLate = 0, hTot = 0, tId = -1, tN = 0, tx0 = 0, ty0 = 0, tx = 0, ty = 0;
+let kf = 0, kb = 0, kl = 0, kr = 0, ku = 0, kd = 0, ks = 0, mdx = 0, mdy = 0, lkx = 0, lky = 0, l2x = 0, l2y = 0, hN = 0, hMax = 0, hMin = 1e9, hPer = 1e9, hLate = 0, hTot = 0, jx = 0, jy = 0;
 const TANH = 0.6, NEAR = 0.1, EXPO = 0.62, RAYS = 0.54;
 const submitList = [null];
 const rowOrd = new Uint8Array(CELLS);
@@ -552,18 +552,19 @@ function frame(now) {
   }
   F[TIME] += dt;
   {
-    // touch: holding the finger away from where it went down keeps turning, like a joystick
-    if (tId >= 0) {
-      const tr = 4 / (innerWidth < innerHeight ? innerWidth : innerHeight); let jx = (tx - tx0) * tr, jy = (ty - ty0) * tr;
-      jx = jx > 1 ? 1 : jx < -1 ? -1 : jx; jy = jy > 1 ? 1 : jy < -1 ? -1 : jy;
-      lkx += jx * 1.5 * dt; lky += jy * dt;
-    }
     // mouse look through two cascaded low-pass stages
     const kq = 1 - exp(-dt * 30); lkx += mdx * 0.0022; lky += mdy * 0.0022; mdx = 0; mdy = 0;
     const ax = lkx * kq, ay = lky * kq; lkx -= ax; lky -= ay; l2x += ax; l2y += ay;
     const dyw = l2x * kq, dpt = l2y * kq; l2x -= dyw; l2y -= dpt;
     const yaw = F[YAW] + dyw; let pitch = F[PIT] - dpt; pitch = pitch < -1.55 ? -1.55 : pitch > 1.55 ? 1.55 : pitch;
-    const sp = ks || tN > 1 ? 26 : 7, k = 1 - exp(-dt * 4.5), mf = tId >= 0 ? 0.7 : kf - kb, mr = kr - kl, mu = ku - kd, cp = cos(pitch), sy = sin(yaw), cw = cos(yaw);
+    // touch stick (in stick radii): a small dead zone, full speed at the ring, faster the further past it
+    let sp = ks ? 26 : 7, mf = kf - kb, mr = kr - kl;
+    const jd = sqrt(jx * jx + jy * jy);
+    if (jd > 0.15) {
+      const m = (jd > 0.9 ? 1 : (jd - 0.15) / 0.75) / jd, f = (jd - 1.1) / 0.4;
+      mf -= jy * m; mr += jx * m; if (f > 0) sp += 19 * (f > 1 ? 1 : f);
+    }
+    const k = 1 - exp(-dt * 4.5), mu = ku - kd, cp = cos(pitch), sy = sin(yaw), cw = cos(yaw);
     const vx = F[VX] + ((sy * cp * mf + cw * mr) * sp - F[VX]) * k, vy = F[VY] + ((sin(pitch) * mf + mu) * sp - F[VY]) * k, vz = F[VZ] + ((-cw * cp * mf + sy * mr) * sp - F[VZ]) * k;
     let x = F[CX] + vx * dt, y = F[CY] + vy * dt, z = F[CZ] + vz * dt;
     const rad = sqrt(x * x + z * z); if (rad > 150) { x *= 150 / rad; z *= 150 / rad; }
@@ -588,30 +589,55 @@ const key = (e, v) => {
       if (e.code === 'KeyH') { hud = !hud; hTot = 0; hPer = 1e9; info.textContent = ''; }
       else if (e.code === 'KeyM') mute();
       else if (e.code === 'Escape') ui(true);
-      else if (e.code >= 'Digit1' && e.code <= 'Digit6') lookAt(...POSES[e.code.charCodeAt(5) - 49]);
+      else if (e.code >= 'Digit1' && e.code <= 'Digit6') lookAt(...POSES[vp = e.code.charCodeAt(5) - 49]);
     }
   }
 };
 // behind the menu only the stats and mute keys work
 addEventListener('keydown', (e) => { if (menu && e.code !== 'KeyH' && e.code !== 'KeyM') return; sound(); key(e, 1); });
 addEventListener('keyup', (e) => key(e, 0));
-const release = () => { kf = kb = kl = kr = ku = kd = ks = 0; tId = -1; tN = 0; };
+const release = () => { kf = kb = kl = kr = ku = kd = ks = 0; lId = -1; idle(); };
 const capture = () => { sound(); const p = canvas.requestPointerLock({ unadjustedMovement: true }); if (p && p.catch) p.catch(() => canvas.requestPointerLock()).catch(() => 0); };
 canvas.addEventListener('click', capture);
 addEventListener('mousemove', (e) => { if (document.pointerLockElement === canvas) { mdx += e.movementX; mdy += e.movementY; } });
 addEventListener('blur', release);
+// Touch: twin sticks. A finger put down on the left half is a floating stick for swimming (its base follows a finger
+// dragged far past the ring), a finger on the right half drags the view. Positions are in the page's own axes, which
+// turn with it when it lies on its side.
+const stick = $('j'), knob = $('n'), root = document.documentElement;
+let mId = -1, lId = -1, sx0 = 0, sy0 = 0, lx0 = 0, ly0 = 0, vp = 0;
+const place = (x, y) => { stick.style.left = x + 'px'; stick.style.top = y + 'px'; };
+const idle = () => { mId = -1; jx = jy = 0; knob.style.transform = stick.className = ''; place(body.clientWidth * 0.16, body.clientHeight * 0.66); };
 const touch = (e) => {
-  e.preventDefault(); sound(); tN = e.touches.length;
-  let f = null, first = false; for (let i = 0; i < tN; i++) if (e.touches[i].identifier === tId) f = e.touches[i];
-  if (!f) { tId = -1; if (tN) { f = e.touches[0]; tId = f.identifier; first = true; } }
-  if (f) {
-    // the touch axes turn with the page when it lies on its side
-    const x = rot.matches ? f.clientY : f.clientX, y = rot.matches ? -f.clientX : f.clientY, s = 1100 / min(innerWidth, innerHeight);
-    if (first) { tx0 = x; ty0 = y; } else { mdx += (x - tx) * s; mdy += (y - ty) * s; } // the view follows the finger at once
-    tx = x; ty = y;
+  e.preventDefault(); sound(); root.className = 't';
+  const R = rot.matches, vm = min(innerWidth, innerHeight), r = 0.14 * vm, s = 1100 / vm, end = e.type[5] !== 'm' && e.type[5] !== 's';
+  for (const t of e.changedTouches) {
+    const id = t.identifier, x = R ? t.clientY : t.clientX, y = R ? innerWidth - t.clientX : t.clientY;
+    if (e.type === 'touchstart') {
+      if (mId < 0 && x < body.clientWidth / 2) { mId = id; sx0 = x; sy0 = y; place(x, y); stick.className = 'on'; }
+      else if (lId < 0) { lId = id; lx0 = x; ly0 = y; }
+    } else if (id === mId) {
+      if (end) { idle(); continue; }
+      let dx = (x - sx0) / r, dy = (y - sy0) / r; const d = hypot(dx, dy);
+      if (d > 1.6) { const k = 1.6 / d; sx0 += (dx - dx * k) * r; sy0 += (dy - dy * k) * r; dx *= k; dy *= k; place(sx0, sy0); }
+      jx = dx; jy = dy; knob.style.transform = `translate(${dx * r}px,${dy * r}px)`; stick.className = d > 1.1 ? 'on f' : 'on';
+    } else if (id === lId) {
+      if (end) lId = -1; else { mdx += (x - lx0) * s; mdy += (y - ly0) * s; lx0 = x; ly0 = y; }
+    }
   }
 };
 for (const n of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) canvas.addEventListener(n, touch, { passive: false });
+addEventListener('resize', () => mId < 0 && idle());
+// buttons in the corner: up and down while held, next viewpoint, sound, menu
+const hold = (b, f) => { for (const n of ['pointerdown', 'pointerup', 'pointercancel']) b.addEventListener(n, (e) => { e.preventDefault(); f(n === 'pointerdown' ? 1 : 0); }); };
+hold($('y'), (v) => ku = v); hold($('z'), (v) => kd = v);
+$('x').onclick = () => lookAt(...POSES[vp = (vp + 1) % 6]);
+$('v').onclick = () => { sound(); mute(); };
+addEventListener('contextmenu', (e) => e.preventDefault());
+// phones: keep the screen on while swimming (the lock is dropped whenever the page is hidden)
+let wake = null;
+const awake = (on) => { if (!mob) return; if (on) navigator.wakeLock?.request('screen').then((w) => { if (menu) w.release(); else wake = w; }, () => 0); else { wake?.release(); wake = null; } };
+document.addEventListener('visibilitychange', () => !document.hidden && !menu && awake(1));
 
 // ---------------------------------------------------------------- menu
 // The scene keeps rendering (blurred by CSS) behind the menu. Esc, losing the mouse or the corner button open it.
@@ -621,7 +647,7 @@ const ui = (m) => {
   if (dead) return;
   menu = m; body.className = m ? 'm' : document.pointerLockElement ? 'g p' : 'g';
   // focus the dive button so Enter works (delayed: it can't take focus while still hidden)
-  if (m) { release(); setTimeout(() => menu && bDive.focus(), 100); } else document.activeElement.blur();
+  if (m) { release(); awake(0); setTimeout(() => menu && bDive.focus(), 100); } else { document.activeElement.blur(); awake(1); }
 };
 const go = () => {
   sound(); ui(false); bDive.textContent = 'Resume';
@@ -630,6 +656,7 @@ const go = () => {
   if (!mob) capture();
 };
 bDive.onclick = go; $('o').onclick = () => ui(true);
+if (mob) root.className = 't';
 // detail buttons: the current level is lit, the others reload the page with theirs
 $('q').querySelectorAll('button').forEach((b, i) => { if (i === 2 - LV) b.className = 'on'; else b.onclick = () => { keep('abyssal', 2 - i); location.reload(); }; });
 document.addEventListener('pointerlockchange', () => ui(!document.pointerLockElement));

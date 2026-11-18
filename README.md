@@ -47,7 +47,7 @@ Nothing to install, and it works offline. It needs a browser with **WebGPU**. If
 
 The seabed, cliffs and arches are solid: you glide along the rock instead of swimming into it, and you still fit through every tunnel and arch. Kelp, plants, corals, sponges, loose rocks, the floating boulders, the ship and the whale tail you can swim through.
 
-**On a touchscreen:** hold one finger down to swim forward and slide it to steer. Put a second finger down to go faster. The `≡` button in the corner opens the menu. Phones always show the scene in landscape and start on Low or Medium detail. (Touch support is experimental.)
+**On a touchscreen:** twin sticks. Put your left thumb down anywhere on the left half to get a swim stick there: push it to swim, and push past its ring to go faster. Drag with your right thumb to look around. `▲` `▼` in the lower right take you up and down; the buttons in the top corner jump to the next viewpoint (`◎`), turn the sound on and off (`♪`) and open the menu (`≡`). Phones always show the scene in landscape, keep the screen on while you swim, and start on Low or Medium detail.
 
 ## Detail levels
 
