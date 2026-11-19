@@ -316,43 +316,51 @@ meshes.push(meshFluke(), meshShip().build(), meshManta().build(), meshFish().bui
 // ---------------------------------------------------------------- geometry for the GPU
 // One vertex buffer (the terrain's vertices, then the meshes') and one index buffer of absolute indices (the terrain in
 // clusters, then the meshes), read by the visibility pass as storage and by the shadow bake as vertex / index buffers.
-const TC = clusterTerrain(T), nT = T.nv, I0 = TC.ib.length;
+// Each buffer is made at its full size and every part written straight to its place, so the generator's arrays (hundreds
+// of MB on High) are never copied into a merged one, and each is let go as soon as the GPU has it.
+const SV_ = BU.VERTEX | BU.STORAGE;
+const gpuBuf = (size, usage) => device.createBuffer({ size: (size + 3) & ~3, usage: usage | BU.COPY_DST });
+const put = (b, at, a) => Q.writeBuffer(b, at, a.buffer || a, a.byteOffset || 0, a.byteLength);
+let TC = clusterTerrain(T);
+const nCl = TC.nCl, nT = T.nv, I0 = TC.ib.length;
+T.ib = T.wp = T.wn = 0; // the clusters hold the terrain's triangles now
 let nV = nT, nI = I0;
 for (const m of meshes) { m.v0 = nV; m.i0 = nI; nV += m.nv; nI += m.ib.length; }
-const allV = new Uint8Array(nV * 16), allI = new Uint32Array(nI);
-allV.set(new Uint8Array(T.vb)); allI.set(TC.ib);
-for (const m of meshes) { allV.set(new Uint8Array(m.vb), m.v0 * 16); for (let j = 0; j < m.ib.length; j++) allI[m.i0 + j] = m.ib[j] + m.v0; }
+const vbAll = gpuBuf(nV * 16, SV_), ibAll = gpuBuf(nI * 4, BU.INDEX | BU.STORAGE), tbClusters = buf(TC.box, BU.STORAGE);
+put(vbAll, 0, T.vb); put(ibAll, 0, TC.ib);
+T.vb = TC = 0;
+for (const m of meshes) { put(vbAll, m.v0 * 16, m.vb); put(ibAll, m.i0 * 4, Uint32Array.from(m.ib, (i) => i + m.v0)); }
 // bounding radius of each mesh around its origin
 const meshR = meshes.map((m) => { const f = new Float32Array(m.vb); let r = 0; for (let k = 0; k < m.nv; k++) r = max(r, hypot(f[k * 4], f[k * 4 + 1], f[k * 4 + 2])); return r; });
-const SV_ = BU.VERTEX | BU.STORAGE;
-const vbAll = buf(allV, SV_), ibAll = buf(allI, BU.INDEX | BU.STORAGE), tbClusters = buf(TC.box, BU.STORAGE);
 // solid instances, 48 bytes each: the set pieces and boulders (by mesh), the terrain's identity, the rock chunks and the
 // props. Each belongs to a class (CLS) that says which mesh it is drawn with up to which distance (see W_CULL).
 const nSolid = Wd.solids.data.length / 12, chunkAt = [], propAt = [];
 let nSI = nSolid + 1;
 for (const c of Wd.chunks) { chunkAt.push(nSI); nSI += c.n; }
 for (const c of Wd.props) { propAt.push(nSI); nSI += c.n; }
-const solidData = new Float32Array(nSI * 12), cls = new Uint32Array(nSI).fill(~0), CLASSES = [];
-solidData.set(Wd.solids.data); solidData.set([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0], nSolid * 12);
+const siAll = gpuBuf(nSI * 48, SV_), cls = new Uint32Array(nSI).fill(~0), CLASSES = [];
+put(siAll, 0, Wd.solids.data); put(siAll, nSolid * 48, new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0]));
 const addClass = (at, n, near, far, d0, d1) => { cls.fill(CLASSES.length, at, at + n); CLASSES.push([near, far, d0, d1, n]); };
 for (let m = 0; m < 12; m++) { const g = Wd.solids.ranges[m]; addClass(g[0], g[1], m, -1, -1, -1); }
-Wd.chunks.forEach((c, i) => { const big = i > 2 && i < 6, d = i > 5 ? 30 : big ? 40 : 96; solidData.set(c.data, chunkAt[i] * 12); addClass(chunkAt[i], c.n, 14 + i, big ? 20 + i : -1, d, big ? 150 : d); });
-Wd.props.forEach((c, i) => { const lod = i === 3 || i === 4; solidData.set(c.data, propAt[i] * 12); addClass(propAt[i], c.n, 4 + i, lod ? 18 + i : -1, lod ? 6 : 110, 110); });
-const siAll = buf(solidData, SV_), clsBuf = buf(cls, BU.STORAGE);
+Wd.chunks.forEach((c, i) => { const big = i > 2 && i < 6, d = i > 5 ? 30 : big ? 40 : 96; put(siAll, chunkAt[i] * 48, c.data); addClass(chunkAt[i], c.n, 14 + i, big ? 20 + i : -1, d, big ? 150 : d); });
+Wd.props.forEach((c, i) => { const lod = i === 3 || i === 4; put(siAll, propAt[i] * 48, c.data); addClass(propAt[i], c.n, 4 + i, lod ? 18 + i : -1, lod ? 6 : 110, 110); });
+const clsBuf = buf(cls, BU.STORAGE);
 const nFish = Wd.fish.length / 8, nManta = Wd.mantas.length / 8, nAnim = nFish + nManta;
 const animData = new Float32Array(nAnim * 8); animData.set(Wd.fish); animData.set(Wd.mantas, nFish * 8);
 const aiAll = buf(animData, BU.STORAGE);
 // leaves, 36 bytes each: the near set (big), its decimated far version (bigF), the small plants
 const nBig = Wd.big.n, nBigF = Wd.bigF.n, nLeaf = nBig + nBigF + Wd.small.n;
-const leafData = new Uint8Array(nLeaf * 36);
-leafData.set(new Uint8Array(Wd.big.buf)); leafData.set(new Uint8Array(Wd.bigF.buf), nBig * 36); leafData.set(new Uint8Array(Wd.small.buf), (nBig + nBigF) * 36);
-const lbAll = buf(leafData, SV_);
+const lbAll = gpuBuf(nLeaf * 36, SV_);
+put(lbAll, 0, Wd.big.buf); put(lbAll, nBig * 36, Wd.bigF.buf); put(lbAll, (nBig + nBigF) * 36, Wd.small.buf);
 const ibBubbles = buf(Wd.bubbles, BU.VERTEX), ibSnowB = buf(Wd.snow, BU.VERTEX);
 const ibGl = buf(Wd.glints, BU.VERTEX), nGl = Wd.glints.length / 8;
 const nBub = Wd.bubbles.length / 8, nSnow = Wd.snow.length / 4;
 const MANTA = meshes[12], FISH = meshes[13];
 Q.writeTexture({ texture: tVol }, Wd.volD, { bytesPerRow: NX, rowsPerImage: NY / 2 }, [NX / 2, NY / 2, NZ / 2]);
 Q.writeTexture({ texture: tMap }, Wd.gm, { bytesPerRow: 2048 }, [512, 512]);
+// the GPU has its own copies now: let go of the generator's (about 300 MB on High)
+for (const o of [Wd.big, Wd.bigF, Wd.small, ...Wd.chunks, ...Wd.props]) o.buf = o.data = 0;
+Wd.glints = Wd.volD = Wd.gm = 0;
 
 // ---------------------------------------------------------------- draws (GPU-driven)
 // 33 indirect draws: 0 terrain clusters, 1 + m solid mesh m, 27 fish, 28 mantas, 29-32 leaves (9, 5 and 3 rows of the
@@ -360,7 +368,7 @@ Q.writeTexture({ texture: tMap }, Wd.gm, { bytesPerRow: 2048 }, [512, 512]);
 // Draws 33-65 are the same for the second occlusion phase (see W_CULL), with segments of their own.
 const ND = 33, DKIND = (d) => d === 0 ? 0 : d < 27 ? 1 : d - 25;
 const cap = new Uint32Array(ND), ARGT = new Uint32Array(ND * 8);
-cap[0] = TC.nCl; ARGT.set([768, 0, 0, 0], 0);
+cap[0] = nCl; ARGT.set([768, 0, 0, 0], 0);
 for (const [near, far, , , n] of CLASSES) { cap[1 + near] += n; if (far >= 0) cap[1 + far] += n; }
 for (let m = 0; m < 26; m++) ARGT.set([meshes[m].ib.length, 0, meshes[m].i0, 0], (1 + m) * 4);
 cap[27] = nFish; ARGT.set([FISH.ib.length, 0, FISH.i0, 0], 27 * 4);
@@ -373,17 +381,17 @@ for (let d = 0; d < ND * 2; d++) { base[d] = nVis; nVis += cap[d % ND]; }
 const visBuf = device.createBuffer({ size: max(4, nVis * 4), usage: BU.STORAGE });
 const argsBuf = device.createBuffer({ size: ND * 32, usage: BU.INDIRECT | BU.STORAGE | BU.COPY_DST });
 // one word per culled object (clusters, solids, animals, leaves): seen last frame
-const vbBits = device.createBuffer({ size: (TC.nCl + nSI + nAnim + nLeaf) * 4, usage: BU.STORAGE });
+const vbBits = device.createBuffer({ size: (nCl + nSI + nAnim + nLeaf) * 4, usage: BU.STORAGE });
 const diData = new Uint32Array(ND * 128);
 for (let d = 0; d < ND * 2; d++) { diData[d * 64] = base[d]; diData[d * 64 + 1] = DKIND(d % ND); }
 const diBuf = buf(diData, BU.UNIFORM);
 // cull uniforms (struct CU): 0 planes, 20 camera + det, 24 counts, 28 leaf ranges, 32 segment bases, 100 classes,
 // 228 radii, 256 view-projection, 272 pyramid, 276 offsets in vbBits
 const CUB = new ArrayBuffer(1120), CUF = new Float32Array(CUB), CUU = new Uint32Array(CUB);
-CUU.set([TC.nCl, nSI, nAnim, nLeaf], 24); CUU.set([nBig, nBig + nBigF, nFish, 0], 28); CUU.set(base, 32);
+CUU.set([nCl, nSI, nAnim, nLeaf], 24); CUU.set([nBig, nBig + nBigF, nFish, 0], 28); CUU.set(base, 32);
 CLASSES.forEach(([near, far, d0, d1], i) => CUF.set([near, far, d0, d1], 100 + i * 4));
 CUF.set(meshR.slice(0, 26), 228);
-CUU.set([TC.nCl, TC.nCl + nSI, TC.nCl + nSI + nAnim, 0], 276);
+CUU.set([nCl, nCl + nSI, nCl + nSI + nAnim, 0], 276);
 const cullU = device.createBuffer({ size: CUB.byteLength, usage: BU.UNIFORM | BU.COPY_DST });
 const cullEntries = [cullU, tbClusters, siAll, clsBuf, aiAll, lbAll, visBuf, argsBuf, vbBits].map((b, binding) => ({ binding, resource: { buffer: b } }));
 const geo = [vbAll, ibAll, siAll, aiAll, lbAll].map((b, binding) => ({ binding, resource: { buffer: b } }));
@@ -439,9 +447,6 @@ const visBundle = [0, ND].map((d0) => {
   if (!LV) for (let i = 0; i < 6; i++) if (Wd.props[i].n) await meshShadow(meshes[4 + i], propAt[i], Wd.props[i].n);
   await batches(nBig, 4, (r, a, c) => { r.setPipeline(pLeafSh); r.setVertexBuffer(0, lbAll); r.draw(6, c, 0, a); });
 }
-// the GPU has its own copies now: let go of the generator's (about 300 MB)
-for (const o of [Wd.big, Wd.bigF, Wd.small, ...Wd.chunks, ...Wd.props]) o.buf = o.data = 0;
-Wd.glints = Wd.volD = Wd.gm = T.vb = T.ib = T.wp = T.wn = 0;
 
 // ---------------------------------------------------------------- render targets (rebuilt on resize)
 // The scene is drawn at `pix` pixels and scaled up to the window. frame() tunes it and the draw distance scale `det`
@@ -540,7 +545,7 @@ const PVP = new Float32Array(16);
 let nFrame = 0, waterAt = -1e9;
 function cull(c, ph) {
   c.setBindGroup(0, bgCull);
-  c.setPipeline(pCullT[ph]); c.dispatchWorkgroups(ceil(TC.nCl / 64));
+  c.setPipeline(pCullT[ph]); c.dispatchWorkgroups(ceil(nCl / 64));
   c.setPipeline(pCullS[ph]); c.dispatchWorkgroups(ceil(nSI / 64));
   c.setPipeline(pCullA[ph]); c.dispatchWorkgroups(ceil(nAnim / 64));
   c.setPipeline(pCullL[ph]); c.dispatchWorkgroups(ceil(nLeaf / 64));

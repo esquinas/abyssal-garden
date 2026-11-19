@@ -49,6 +49,6 @@
     // render n frames, return the GPU times (ms) measured meanwhile
     frames: async (n) => { const out = []; for (let i = 0; i < n; i++) { F[GPU] = 0; F[LAST] = performance.now(); render(1); await Q.onSubmittedWorkDone(); await new Promise((r) => setTimeout(r, 20)); if (F[GPU] > 0) out.push(F[GPU]); } return out; },
     size: () => [W, H],
-    stats: () => ({ vertices: nV, indices: nI, clusters: TC.nCl, solids: nSI, leaves: nLeaf, animals: nAnim, visible: nVis }),
+    stats: () => ({ vertices: nV, indices: nI, clusters: nCl, solids: nSI, leaves: nLeaf, animals: nAnim, visCapacity: nVis }),
   };
 }

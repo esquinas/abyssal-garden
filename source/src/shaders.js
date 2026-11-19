@@ -794,7 +794,12 @@ fn gone(v: u32) { if (PHASE == 2u) { VB[v] = 0u; } }
 }
 @compute @workgroup_size(64) fn cullA(@builtin(global_invocation_id) id: vec3u) {
   let k = id.x; if (k >= u.n.z) { return; }
-  let v = u.vo.y + k; let s = AIB[k]; let fish = k < u.ln.z; let r = s.a.w + select(3. + s.b.z * 1.2, 5., fish);
+  let v = u.vo.y + k; let s = AIB[k]; let fish = k < u.ln.z;
+  // the loop's farthest reach from its centre (radius a.w, bobbing up and down), then the mesh at its size (b.z): for
+  // a manta, plus the flapping wings and the swaying tail (< .6); for a fish, scaled up to 1.25x, plus the tail's
+  // wiggle (< .25) and its offset from the school's path (< 3.65 m). See mantaV and fishV.
+  let rm = u.rad[3][select(0u, 1u, fish)];
+  let r = select(length(vec2f(s.a.w, 2.5)) + (rm + .6) * s.b.z, length(vec2f(s.a.w, 2.2)) + 3.65 + (rm * 1.25 + .25) * s.b.z, fish);
   if (!inF(s.a.xyz, r)) { gone(v); return; }
   pick(v, select(28u, 27u, fish), k, s.a.xyz - r, s.a.xyz + r);
 }
