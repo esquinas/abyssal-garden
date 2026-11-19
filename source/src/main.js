@@ -35,12 +35,12 @@ device.addEventListener('uncapturederror', (e) => console.error('GPU: ' + e.erro
 // Restarts the page (at level lv, if given) after releasing the GPU, so the next page finds the memory free.
 // `leaving` stops the device loss this causes from being taken for a crash.
 let leaving = 0;
-const restart = (lv) => { leaving = 1; if (lv != null) keep('abyssal', lv); device.destroy(); setTimeout(() => location.reload(), 150); };
+const restart = (lv) => { leaving = 1; body.dataset.q = 1; if (!dead) $('s').textContent = 'Restarting…'; if (lv != null) keep('abyssal', lv); device.destroy(); setTimeout(() => location.reload(), 150); };
 // out of memory or a GPU timeout: restart a level lower, or on Low say what happened
 device.lost.then((l) => {
   if (leaving || l.reason === 'destroyed') return; // the page is closing or restarting
   if (LV < 2) return restart(LV + 1);
-  dead = body.className = 'l e'; $('s').textContent = 'The graphics device was lost. Reload the page to try again.';
+  body.dataset.q = 1; dead = body.className = 'l e'; $('s').textContent = 'The graphics device was lost. Reload the page to try again.';
 });
 const ctx = canvas.getContext('webgpu'), FMT = navigator.gpu.getPreferredCanvasFormat();
 const Q = device.queue, HDR = 'rgba16float', DEPTH = 'depth32float';
@@ -174,20 +174,27 @@ let D;
 {
   const prims = primBuffer();
   const m = mod(W_DENS), p = device.createComputePipeline({ layout: 'auto', compute: { module: m, entryPoint: 'main' } });
-  const size = NX * NY * NZ * 4;
+  // Computed in slabs of SZ z-slices, one submit each, waiting for each to finish: phone GPUs reset the device when a
+  // single job runs too long, and the whole volume at once (21M samples) is close to that limit
+  const SZ = 16, slab = NX * NY * SZ * 4;
   const u = new ArrayBuffer(48), uu = new Uint32Array(u), uf = new Float32Array(u);
   uu[0] = NX; uu[1] = NY; uu[2] = NZ; uf[4] = OX; uf[5] = OY; uf[6] = OZ; uf[7] = VS;
   uu[8] = MESAS.length; uu[9] = ARCHES.length; uu[10] = HOLES.length; uu[11] = CLEARS.length;
-  const bu = buf(new Uint8Array(u), BU.UNIFORM), bp = buf(prims, BU.STORAGE);
-  const bd = device.createBuffer({ size, usage: BU.STORAGE | BU.COPY_SRC }), br = device.createBuffer({ size, usage: BU.MAP_READ | BU.COPY_DST });
+  const bu = device.createBuffer({ size: 48, usage: BU.UNIFORM | BU.COPY_DST }), bp = buf(prims, BU.STORAGE);
+  const bd = device.createBuffer({ size: slab, usage: BU.STORAGE | BU.COPY_SRC }), br = device.createBuffer({ size: slab, usage: BU.MAP_READ | BU.COPY_DST });
   const bg = device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: bu } }, { binding: 1, resource: { buffer: bd } }, { binding: 2, resource: { buffer: bp } }] });
-  const e = device.createCommandEncoder(), c = e.beginComputePass();
-  c.setPipeline(p); c.setBindGroup(0, bg); c.dispatchWorkgroups(NX / 4, NY / 4, NZ / 4); c.end();
-  e.copyBufferToBuffer(bd, 0, br, 0, size);
-  Q.submit([e.finish()]);
-  await br.mapAsync(GPUMapMode.READ);
-  D = new Float32Array(br.getMappedRange().slice(0));
-  br.unmap(); br.destroy(); bd.destroy();
+  D = new Float32Array(NX * NY * NZ);
+  for (let z = 0; z < NZ; z += SZ) {
+    uu[3] = z; Q.writeBuffer(bu, 0, u); // first z-slice of this slab
+    const e = device.createCommandEncoder(), c = e.beginComputePass();
+    c.setPipeline(p); c.setBindGroup(0, bg); c.dispatchWorkgroups(NX / 4, NY / 4, SZ / 4); c.end();
+    e.copyBufferToBuffer(bd, 0, br, 0, slab);
+    Q.submit([e.finish()]);
+    await br.mapAsync(GPUMapMode.READ);
+    D.set(new Float32Array(br.getMappedRange()), z * NX * NY);
+    br.unmap();
+  }
+  br.destroy(); bd.destroy(); bu.destroy(); bp.destroy();
   // rock connected to the seabed: each column's unbroken run up from the bottom is, and the rock above a gap
   // (overhangs, specks) is when it touches rock that is. What never connects is a speck of noise floating in
   // the water (surface nets would make it a small box), so it becomes water
@@ -395,28 +402,42 @@ const visBundle = [0, ND].map((d0) => {
 });
 
 // ---------------------------------------------------------------- one-time bakes: detail texture, shadow map
+// Each bake is its own submit, waited on before the next, and the shadow map is drawn about a million triangles at a
+// time: phone GPUs reset the device when a single job runs too long.
 {
+  const bake = async (f) => { const e = device.createCommandEncoder(); f(e); Q.submit([e.finish()]); await Q.onSubmittedWorkDone(); };
   const m = mod(W_DETAIL), p = device.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] } });
-  const e = device.createCommandEncoder();
-  let r = e.beginRenderPass({ colorAttachments: [colorAtt(tDetail.createView({ baseMipLevel: 0, mipLevelCount: 1 }), true)] });
-  r.setPipeline(p); r.draw(3); r.end();
-  for (let i = 1; i < 11; i++) {
-    r = e.beginRenderPass({ colorAttachments: [colorAtt(tDetail.createView({ baseMipLevel: i, mipLevelCount: 1 }), true)] });
-    r.setPipeline(pMip8); r.setBindGroup(0, blitBG(tDetail.createView({ baseMipLevel: i - 1, mipLevelCount: 1 }))); r.draw(3); r.end();
-  }
-  r = e.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: tShadow.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
-  r.setBindGroup(0, bg0s);
-  r.setPipeline(pTerrSh);
-  r.setVertexBuffer(0, vbAll); r.setVertexBuffer(1, siAll); r.setIndexBuffer(ibAll, 'uint32');
-  r.drawIndexed(I0, 1, 0, 0, nSolid);
-  r.setPipeline(pSolidSh);
-  for (let i = 0; i < 12; i++) { const g = Wd.solids.ranges[i]; if (g[1]) r.drawIndexed(meshes[i].ib.length, g[1], meshes[i].i0, 0, g[0]); }
+  await bake((e) => {
+    let r = e.beginRenderPass({ colorAttachments: [colorAtt(tDetail.createView({ baseMipLevel: 0, mipLevelCount: 1 }), true)] });
+    r.setPipeline(p); r.draw(3); r.end();
+    for (let i = 1; i < 11; i++) {
+      r = e.beginRenderPass({ colorAttachments: [colorAtt(tDetail.createView({ baseMipLevel: i, mipLevelCount: 1 }), true)] });
+      r.setPipeline(pMip8); r.setBindGroup(0, blitBG(tDetail.createView({ baseMipLevel: i - 1, mipLevelCount: 1 }))); r.draw(3); r.end();
+    }
+  });
+  const vSh = tShadow.createView();
+  // a shadow pass: the first one clears the map, the rest draw on top
+  const shadow = (first, f) => bake((e) => {
+    const r = e.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: vSh, depthClearValue: 1, depthLoadOp: first ? 'clear' : 'load', depthStoreOp: 'store' } });
+    r.setBindGroup(0, bg0s); f(r); r.end();
+  });
+  // n instances of a mesh with `tris` triangles each, in batches of about 1M triangles
+  const batches = async (n, tris, f) => { const k = max(1, floor(1e6 / tris)); for (let a = 0; a < n; a += k) await shadow(false, (r) => f(r, a, min(k, n - a))); };
+  await shadow(true, (r) => {
+    r.setPipeline(pTerrSh);
+    r.setVertexBuffer(0, vbAll); r.setVertexBuffer(1, siAll); r.setIndexBuffer(ibAll, 'uint32');
+    r.drawIndexed(I0, 1, 0, 0, nSolid);
+    r.setPipeline(pSolidSh);
+    for (let i = 0; i < 12; i++) { const g = Wd.solids.ranges[i]; if (g[1]) r.drawIndexed(meshes[i].ib.length, g[1], meshes[i].i0, 0, g[0]); }
+  });
   // small rocks, sponges and corals (~35M triangles) only on High: too much for a phone's driver
-  if (!LV) for (let i = 0; i < NCHUNK; i++) if (Wd.chunks[i].n) r.drawIndexed(meshes[14 + i].ib.length, Wd.chunks[i].n, meshes[14 + i].i0, 0, chunkAt[i]);
-  if (!LV) for (let i = 0; i < 6; i++) if (Wd.props[i].n) r.drawIndexed(meshes[4 + i].ib.length, Wd.props[i].n, meshes[4 + i].i0, 0, propAt[i]);
-  r.setPipeline(pLeafSh); r.setVertexBuffer(0, lbAll); r.draw(6, nBig);
-  r.end();
-  Q.submit([e.finish()]);
+  const meshShadow = (msh, at, n) => batches(n, msh.ib.length / 3, (r, a, c) => {
+    r.setPipeline(pSolidSh); r.setVertexBuffer(0, vbAll); r.setVertexBuffer(1, siAll); r.setIndexBuffer(ibAll, 'uint32');
+    r.drawIndexed(msh.ib.length, c, msh.i0, 0, at + a);
+  });
+  if (!LV) for (let i = 0; i < NCHUNK; i++) if (Wd.chunks[i].n) await meshShadow(meshes[14 + i], chunkAt[i], Wd.chunks[i].n);
+  if (!LV) for (let i = 0; i < 6; i++) if (Wd.props[i].n) await meshShadow(meshes[4 + i], propAt[i], Wd.props[i].n);
+  await batches(nBig, 4, (r, a, c) => { r.setPipeline(pLeafSh); r.setVertexBuffer(0, lbAll); r.draw(6, c, 0, a); });
 }
 // the GPU has its own copies now: let go of the generator's (about 300 MB)
 for (const o of [Wd.big, Wd.bigF, Wd.small, ...Wd.chunks, ...Wd.props]) o.buf = o.data = 0;
@@ -496,7 +517,7 @@ if (hasTS) {
   qResolve = device.createBuffer({ size: 16, usage: BU.QUERY_RESOLVE | BU.COPY_SRC });
   for (let i = 0; i < 6; i++) {
     const b = device.createBuffer({ size: 16, usage: BU.MAP_READ | BU.COPY_DST });
-    const o = { b, busy: false, done: null };
+    const o = { b, busy: false, done: null, lost: () => 0 };
     o.done = () => {
       const a = new BigInt64Array(b.getMappedRange());
       const ms = Number(a[1] - a[0]) / 1e6; F[GPU] = ms; b.unmap(); o.busy = false;
@@ -607,7 +628,7 @@ function render() {
   if (slot) { e.resolveQuerySet(qs, 0, 2, qResolve, 0); e.copyBufferToBuffer(qResolve, 0, slot.b, 0, 16); }
   submitList[0] = e.finish();
   Q.submit(submitList);
-  if (slot) { slot.busy = true; slot.b.mapAsync(GPUMapMode.READ).then(slot.done); }
+  if (slot) { slot.busy = true; slot.b.mapAsync(GPUMapMode.READ).then(slot.done, slot.lost); }
   nFrame++; taaReset = 0;
 }
 

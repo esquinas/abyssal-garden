@@ -82,9 +82,10 @@ fn dens(p: vec3f) -> f32 {
   return min(d, 3. - p.y);
 }
 @compute @workgroup_size(4, 4, 4) fn main(@builtin(global_invocation_id) id: vec3u) {
-  if (any(id >= u.n.xyz)) { return; }
-  var d = dens(u.o.xyz + vec3f(id) * u.o.w);
-  if (id.x == 0u || id.z == 0u || id.x == u.n.x - 1u || id.z == u.n.z - 1u || id.y == u.n.y - 1u) { d = -1.; }
+  let g = vec3u(id.x, id.y, id.z + u.n.w); // u.n.w: the slab's first z-slice; D holds only the slab
+  if (any(g >= u.n.xyz)) { return; }
+  var d = dens(u.o.xyz + vec3f(g) * u.o.w);
+  if (g.x == 0u || g.z == 0u || g.x == u.n.x - 1u || g.z == u.n.z - 1u || g.y == u.n.y - 1u) { d = -1.; }
   D[id.x + u.n.x * (id.y + u.n.y * id.z)] = d;
 }
 `;
