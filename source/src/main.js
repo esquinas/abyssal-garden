@@ -27,7 +27,10 @@ for (let i = 0; i < 7 && !adapter; i++) {
 if (!adapter) fail("The browser isn't letting this page use the graphics chip right now. This can happen after a crash. Close this tab and open the page again, or restart the browser.");
 $('w').hidden = !!navigator.userAgentData; // only Chromium-based browsers have it
 const hasTS = adapter.features.has('timestamp-query');
-const device = await adapter.requestDevice({ requiredFeatures: hasTS ? ['timestamp-query'] : [] });
+// the terrain's vertex and index buffers are read as storage buffers, which can be larger than the default limit
+const AL = adapter.limits;
+const device = await adapter.requestDevice({ requiredFeatures: hasTS ? ['timestamp-query'] : [],
+  requiredLimits: { maxStorageBufferBindingSize: AL.maxStorageBufferBindingSize, maxBufferSize: AL.maxBufferSize } });
 device.addEventListener('uncapturederror', (e) => console.error('GPU: ' + e.error.message));
 // Restarts the page (at level lv, if given) after releasing the GPU, so the next page finds the memory free.
 // `leaving` stops the device loss this causes from being taken for a crash.
@@ -58,8 +61,9 @@ const tDetail = tex(1024, 1024, 'rgba8unorm', TU.RENDER_ATTACHMENT | TU.TEXTURE_
 const tVol = tex(NX / 2, NY / 2, 'rg8unorm', TU.TEXTURE_BINDING | TU.COPY_DST, { d: NZ / 2 });
 const tMap = tex(512, 512, 'rgba8unorm', TU.TEXTURE_BINDING | TU.COPY_DST);
 
-const UB = new Float32Array(60), UBS = new Float32Array(60);
-const ubo = device.createBuffer({ size: 240, usage: BU.UNIFORM | BU.COPY_DST }), uboS = device.createBuffer({ size: 240, usage: BU.UNIFORM | BU.COPY_DST });
+// struct G in shaders.js: 0 vp, 16 sm, 32 cam, 36 right, 40 up, 44 fwd, 48 sun, 52 res, 56 mis, 60 jit, 64 pvp
+const UB = new Float32Array(80), UBS = new Float32Array(80);
+const ubo = device.createBuffer({ size: 320, usage: BU.UNIFORM | BU.COPY_DST }), uboS = device.createBuffer({ size: 320, usage: BU.UNIFORM | BU.COPY_DST });
 const WT = new Float32Array(4), uboW = device.createBuffer({ size: 16, usage: BU.UNIFORM | BU.COPY_DST });
 
 const VF = SS.VERTEX | SS.FRAGMENT;
@@ -85,42 +89,50 @@ const pMip8 = blitPipe('fsMip', 'rgba8unorm'), pMip16 = blitPipe('fsMip', HDR), 
 const blitBG = (view) => device.createBindGroup({ layout: bglBlit, entries: [{ binding: 0, resource: view }, { binding: 1, resource: sClamp }] });
 const colorAtt = (view, clear) => ({ view, loadOp: clear ? 'clear' : 'load', storeOp: 'store', clearValue: [0, 0, 0, 0] });
 
-// vertex layouts
+// vertex layouts (the shadow bake; everything else pulls its geometry from storage buffers)
 const A = (shaderLocation, offset, format) => ({ shaderLocation, offset, format });
 const vbSolid = { arrayStride: 16, attributes: [A(0, 0, 'float32x3'), A(1, 12, 'snorm8x4')] };
 const ibSolid = { arrayStride: 48, stepMode: 'instance', attributes: [A(2, 0, 'float32x4'), A(3, 16, 'float32x4'), A(4, 32, 'float32x4')] };
 const ibLeaf = { arrayStride: 36, stepMode: 'instance', attributes: [A(0, 0, 'float32x4'), A(1, 16, 'float32x4'), A(2, 32, 'unorm8x4')] };
-const ibAnim = { arrayStride: 32, stepMode: 'instance', attributes: [A(2, 0, 'float32x4'), A(3, 16, 'float32x4')] };
 const ibBub = { arrayStride: 32, stepMode: 'instance', attributes: [A(0, 0, 'float32x4'), A(1, 16, 'float32x4')] };
 const ibSnow = { arrayStride: 16, stepMode: 'instance', attributes: [A(0, 0, 'float32x4')] };
 
-const scenePipe = (m, vsE, fsE, buffers, o = {}) => device.createRenderPipeline({ layout: pl0,
+const scenePipe = (m, vsE, fsE, buffers, o = {}) => device.createRenderPipeline({ layout: o.layout || pl0,
   vertex: { module: m, entryPoint: vsE, buffers, constants: o.constants },
-  fragment: { module: m, entryPoint: fsE, targets: [{ format: HDR, blend: o.blend }] },
+  fragment: { module: m, entryPoint: fsE, targets: [{ format: o.format || HDR, blend: o.blend }] },
   primitive: { topology: o.strip ? 'triangle-strip' : 'triangle-list', cullMode: o.cull || 'none' },
-  depthStencil: { format: DEPTH, depthWriteEnabled: !o.blend, depthCompare: 'greater' }, multisample: { count: AA } });
+  depthStencil: { format: DEPTH, depthWriteEnabled: o.write ?? !o.blend, depthCompare: o.cmp || 'greater' } });
 const shadowPipe = (m, vsE, buffers, o = {}) => device.createRenderPipeline({ layout: pl0,
   vertex: { module: m, entryPoint: vsE, buffers, constants: o.constants },
   primitive: { topology: o.strip ? 'triangle-strip' : 'triangle-list', cullMode: o.cull || 'none' },
   depthStencil: { format: DEPTH, depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 1.5 } });
 
+// visibility buffer (see W_SCENE): geometry + visible instances for the raster, geometry + the buffer for the resolve
+const RO = { type: 'read-only-storage' }, VFC = VF | SS.COMPUTE;
+const geoEntries = [0, 1, 2, 3, 4].map((binding) => ({ binding, visibility: VFC, buffer: RO }));
+const bglGeo = device.createBindGroupLayout({ entries: [...geoEntries, { binding: 5, visibility: VF, buffer: RO }] });
+const bglGeoR = device.createBindGroupLayout({ entries: [...geoEntries, { binding: 6, visibility: SS.FRAGMENT, texture: { sampleType: 'uint' } }] });
+const bglDI = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: SS.VERTEX, buffer: { hasDynamicOffset: true } }] });
+const plVis = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bglGeo, bglDI] }), plRes = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bglGeoR] });
+const bglCull = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: SS.COMPUTE, buffer: {} },
+  ...[1, 2, 3, 4, 5].map((binding) => ({ binding, visibility: SS.COMPUTE, buffer: RO })),
+  { binding: 6, visibility: SS.COMPUTE, buffer: { type: 'storage' } }, { binding: 7, visibility: SS.COMPUTE, buffer: { type: 'storage' } }] });
+
 await say('Compiling shaders…', 0.05, 300);
-const mSolid = mod(W_SOLID), mLeaf = mod(W_LEAF), mAnim = mod(W_ANIM), mSurf = mod(W_SURF), mSpr = mod(W_SPR);
-const pTerrain = scenePipe(mSolid, 'vs', 'fs', [vbSolid, ibSolid], { cull: 'back' });
-const pSolid = scenePipe(mSolid, 'vs', 'fs', [vbSolid, ibSolid]);
-const pLeaf = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 9 } });
-const pLeaf5 = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 5 } });
-const pLeafS = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 3, FAR: 70 } });
-const pLeafF = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 3 } });
-const pFish = scenePipe(mAnim, 'vsFish', 'fsFish', [vbSolid, ibAnim]);
-const pManta = scenePipe(mAnim, 'vsManta', 'fsManta', [vbSolid, ibAnim]);
+const mScene = mod(W_SCENE), mLeaf = mod(W_LEAF), mSurf = mod(W_SURF), mSpr = mod(W_SPR), mCull = mod(W_CULL);
+const VISF = 'rg32uint';
+const visPipe = (vs, o = {}) => scenePipe(mScene, vs, 'fsId', [], { ...o, layout: plVis, format: VISF, write: true });
+const pVisT = visPipe('vsT', { cull: 'back' }), pVisS = visPipe('vsS'), pVisA = visPipe('vsA'), pVisL = visPipe('vsL', { strip: true });
+const pRes = scenePipe(mScene, 'vs', 'fsRes', [], { layout: plRes, write: false, cmp: 'always' });
 const pSurf = scenePipe(mSurf, 'vs', 'fs', [], { strip: true }), pBack = scenePipe(mSurf, 'vsB', 'fsB', [], { strip: true });
 const pBub = scenePipe(mSpr, 'vsBub', 'fsBub', [ibBub], { strip: true, blend: { color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } } });
 const ADD = { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } };
 const pSnow = scenePipe(mSpr, 'vsSnow', 'fsSnow', [ibSnow], { strip: true, blend: ADD });
-const pGl = scenePipe(mLeaf, 'vsGl', 'fsGl', [ibBub], { strip: true, blend: ADD, constants: { ROWS: 7 } });
-const pSolidSh = shadowPipe(mSolid, 'vs', [vbSolid, ibSolid]), pTerrSh = shadowPipe(mSolid, 'vs', [vbSolid, ibSolid], { cull: 'front' });
+const pGl = scenePipe(mLeaf, 'vsGl', 'fsGl', [ibBub], { strip: true, blend: ADD });
+const pSolidSh = shadowPipe(mScene, 'vsSh', [vbSolid, ibSolid]), pTerrSh = shadowPipe(mScene, 'vsSh', [vbSolid, ibSolid], { cull: 'front' });
 const pLeafSh = shadowPipe(mLeaf, 'vs', [ibLeaf], { strip: true, constants: { ROWS: 3 } });
+const plCull = device.createPipelineLayout({ bindGroupLayouts: [bglCull] });
+const [pCullT, pCullS, pCullA, pCullL] = ['cullT', 'cullS', 'cullA', 'cullL'].map((entryPoint) => device.createComputePipeline({ layout: plCull, compute: { module: mCull, entryPoint } }));
 
 const mWater = mod(W_WATER);
 const pWater = device.createRenderPipeline({ layout: 'auto', vertex: { module: mWater, entryPoint: 'vs' }, fragment: { module: mWater, entryPoint: 'fs', targets: [{ format: HDR }] } });
@@ -129,9 +141,9 @@ const waterViews = [0, 1, 2, 3, 4].map((m) => tWater.createView({ baseMipLevel: 
 const waterBG = waterViews.map((v) => blitBG(v));
 const waterPass = waterViews.map((v) => ({ colorAttachments: [colorAtt(v, true)] }));
 
-const mRays = mod(W_RAYS), mPost = mod(W_POST), mRB = mod(W_RBLUR);
-const pRB = device.createRenderPipeline({ layout: 'auto', vertex: { module: mRB, entryPoint: 'vs' }, fragment: { module: mRB, entryPoint: 'fs', targets: [{ format: HDR }] } });
-const pRays = device.createRenderPipeline({ layout: 'auto', vertex: { module: mRays, entryPoint: 'vs' }, fragment: { module: mRays, entryPoint: 'fs', targets: [{ format: HDR }] } });
+const fsPipe = (w) => { const m = mod(w); return device.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: 'fs', targets: [{ format: HDR }] } }); };
+const pRays = fsPipe(W_RAYS), pRT = fsPipe(W_RTEMP), pTAA = fsPipe(W_TAA);
+const mPost = mod(W_POST);
 const pPost = device.createRenderPipeline({ layout: 'auto', vertex: { module: mPost, entryPoint: 'vs' }, fragment: { module: mPost, entryPoint: 'fs', targets: [{ format: FMT }] } });
 
 // ---------------------------------------------------------------- sun + shadow matrix
@@ -252,7 +264,7 @@ function aim() {
   F[CX] = P6[0]; F[CY] = P6[1]; F[CZ] = P6[2];
   F[YAW] = atan2(dx, -dz); F[PIT] = atan2(dy, sqrt(dx * dx + dz * dz));
 }
-const lookAt = (x, y, z, tx, ty, tz) => { P6[0] = x; P6[1] = y; P6[2] = z; P6[3] = tx; P6[4] = ty; P6[5] = tz; aim(); };
+const lookAt = (x, y, z, tx, ty, tz) => { P6[0] = x; P6[1] = y; P6[2] = z; P6[3] = tx; P6[4] = ty; P6[5] = tz; aim(); taaReset = 1; }; // a jump: no history
 // camera spline (Catmull-Rom over position + look-at) at parameter F[SPL]
 function flyRaw() {
   const s = F[SPL]; let i = floor(s) | 0; if (i > FLYN - 2) i = FLYN - 2;
@@ -292,23 +304,87 @@ const meshes = [meshChunk(1, 3), meshChunk(7, 3), meshChunk(13, 3), meshChunk(22
   meshCoral(0), meshCoral(1), meshTubes()].map((m) => m.build());
 meshes.push(meshFluke(), meshShip().build(), meshManta().build(), meshFish().build(),
   meshChunk(3).build(), meshChunk(11).build(), meshChunk(29).build(), meshChunk(5, 3).build(), meshChunk(17, 3).build(), meshChunk(41, 3).build(), meshChunk(9, 1).build(), meshCoral(0, 1).build(), meshCoral(1, 1).build(), meshChunk(5, 2, 1).build(), meshChunk(17, 2, 1).build(), meshChunk(41, 2, 1).build());
-let nV = 0, nI = 0;
+// ---------------------------------------------------------------- geometry for the GPU
+// One vertex buffer (the terrain's vertices, then the meshes') and one index buffer of absolute indices (the terrain in
+// clusters, then the meshes), read by the visibility pass as storage and by the shadow bake as vertex / index buffers.
+const TC = clusterTerrain(T), nT = T.nv, I0 = TC.ib.length;
+let nV = nT, nI = I0;
 for (const m of meshes) { m.v0 = nV; m.i0 = nI; nV += m.nv; nI += m.ib.length; }
 const allV = new Uint8Array(nV * 16), allI = new Uint32Array(nI);
-for (const m of meshes) { allV.set(new Uint8Array(m.vb), m.v0 * 16); allI.set(m.ib, m.i0); }
-const vbMesh = buf(allV, BU.VERTEX), ibMesh = buf(allI, BU.INDEX);
-const vbTerrain = buf(new Uint8Array(T.vb), BU.VERTEX), ibTerrain = buf(T.ib, BU.INDEX);
-const nSolid = Wd.solids.data.length / 12;
-const solidData = new Float32Array((nSolid + 1) * 12); solidData.set(Wd.solids.data); solidData.set([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0], nSolid * 12);
-const ibSolids = buf(solidData, BU.VERTEX);
-const ibChunk = Wd.chunks.map((c) => buf(c.data, BU.VERTEX)), ibProp = Wd.props.map((c) => buf(c.data, BU.VERTEX));
-const ibBig = buf(new Uint8Array(Wd.big.buf), BU.VERTEX), ibBigF = buf(new Uint8Array(Wd.bigF.buf), BU.VERTEX), ibSmall = buf(new Uint8Array(Wd.small.buf), BU.VERTEX);
-const ibFish = buf(Wd.fish, BU.VERTEX), ibManta = buf(Wd.mantas, BU.VERTEX), ibBubbles = buf(Wd.bubbles, BU.VERTEX), ibSnowB = buf(Wd.snow, BU.VERTEX);
+allV.set(new Uint8Array(T.vb)); allI.set(TC.ib);
+for (const m of meshes) { allV.set(new Uint8Array(m.vb), m.v0 * 16); for (let j = 0; j < m.ib.length; j++) allI[m.i0 + j] = m.ib[j] + m.v0; }
+// bounding radius of each mesh around its origin
+const meshR = meshes.map((m) => { const f = new Float32Array(m.vb); let r = 0; for (let k = 0; k < m.nv; k++) r = max(r, hypot(f[k * 4], f[k * 4 + 1], f[k * 4 + 2])); return r; });
+const SV_ = BU.VERTEX | BU.STORAGE;
+const vbAll = buf(allV, SV_), ibAll = buf(allI, BU.INDEX | BU.STORAGE), tbClusters = buf(TC.box, BU.STORAGE);
+// solid instances, 48 bytes each: the set pieces and boulders (by mesh), the terrain's identity, the rock chunks and the
+// props. Each belongs to a class (CLS) that says which mesh it is drawn with up to which distance (see W_CULL).
+const nSolid = Wd.solids.data.length / 12, chunkAt = [], propAt = [];
+let nSI = nSolid + 1;
+for (const c of Wd.chunks) { chunkAt.push(nSI); nSI += c.n; }
+for (const c of Wd.props) { propAt.push(nSI); nSI += c.n; }
+const solidData = new Float32Array(nSI * 12), cls = new Uint32Array(nSI).fill(~0), CLASSES = [];
+solidData.set(Wd.solids.data); solidData.set([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0], nSolid * 12);
+const addClass = (at, n, near, far, d0, d1) => { cls.fill(CLASSES.length, at, at + n); CLASSES.push([near, far, d0, d1, n]); };
+for (let m = 0; m < 12; m++) { const g = Wd.solids.ranges[m]; addClass(g[0], g[1], m, -1, -1, -1); }
+Wd.chunks.forEach((c, i) => { const big = i > 2 && i < 6, d = i > 5 ? 30 : big ? 40 : 96; solidData.set(c.data, chunkAt[i] * 12); addClass(chunkAt[i], c.n, 14 + i, big ? 20 + i : -1, d, big ? 150 : d); });
+Wd.props.forEach((c, i) => { const lod = i === 3 || i === 4; solidData.set(c.data, propAt[i] * 12); addClass(propAt[i], c.n, 4 + i, lod ? 18 + i : -1, lod ? 6 : 110, 110); });
+const siAll = buf(solidData, SV_), clsBuf = buf(cls, BU.STORAGE);
+const nFish = Wd.fish.length / 8, nManta = Wd.mantas.length / 8, nAnim = nFish + nManta;
+const animData = new Float32Array(nAnim * 8); animData.set(Wd.fish); animData.set(Wd.mantas, nFish * 8);
+const aiAll = buf(animData, BU.STORAGE);
+// leaves, 36 bytes each: the near set (big), its decimated far version (bigF), the small plants
+const nBig = Wd.big.n, nBigF = Wd.bigF.n, nLeaf = nBig + nBigF + Wd.small.n;
+const leafData = new Uint8Array(nLeaf * 36);
+leafData.set(new Uint8Array(Wd.big.buf)); leafData.set(new Uint8Array(Wd.bigF.buf), nBig * 36); leafData.set(new Uint8Array(Wd.small.buf), (nBig + nBigF) * 36);
+const lbAll = buf(leafData, SV_);
+const ibBubbles = buf(Wd.bubbles, BU.VERTEX), ibSnowB = buf(Wd.snow, BU.VERTEX);
 const ibGl = buf(Wd.glints, BU.VERTEX), nGl = Wd.glints.length / 8;
-const nFish = Wd.fish.length / 8, nManta = Wd.mantas.length / 8, nBub = Wd.bubbles.length / 8, nSnow = Wd.snow.length / 4;
+const nBub = Wd.bubbles.length / 8, nSnow = Wd.snow.length / 4;
 const MANTA = meshes[12], FISH = meshes[13];
 Q.writeTexture({ texture: tVol }, Wd.volD, { bytesPerRow: NX, rowsPerImage: NY / 2 }, [NX / 2, NY / 2, NZ / 2]);
 Q.writeTexture({ texture: tMap }, Wd.gm, { bytesPerRow: 2048 }, [512, 512]);
+
+// ---------------------------------------------------------------- draws (GPU-driven)
+// 33 indirect draws: 0 terrain clusters, 1 + m solid mesh m, 27 fish, 28 mantas, 29-32 leaves (9, 5 and 3 rows of the
+// near set, the far set, the small plants). The cull pass fills each draw's segment of the visible list and its count.
+const ND = 33, DKIND = (d) => d === 0 ? 0 : d < 27 ? 1 : d < 29 ? d - 25 : d - 25;
+const cap = new Uint32Array(ND), ARGT = new Uint32Array(ND * 4);
+cap[0] = TC.nCl; ARGT.set([768, 0, 0, 0], 0);
+for (const [near, far, , , n] of CLASSES) { cap[1 + near] += n; if (far >= 0) cap[1 + far] += n; }
+for (let m = 0; m < 26; m++) ARGT.set([meshes[m].ib.length, 0, meshes[m].i0, 0], (1 + m) * 4);
+cap[27] = nFish; ARGT.set([FISH.ib.length, 0, FISH.i0, 0], 27 * 4);
+cap[28] = nManta; ARGT.set([MANTA.ib.length, 0, MANTA.i0, 0], 28 * 4);
+cap[29] = cap[30] = nBig; cap[31] = nBigF; cap[32] = Wd.small.n;
+[18, 10, 6, 6].forEach((v, i) => ARGT.set([v, 0, 0, 0], (29 + i) * 4));
+const base = new Uint32Array(ND); let nVis = 0;
+for (let d = 0; d < ND; d++) { base[d] = nVis; nVis += cap[d]; }
+const visBuf = device.createBuffer({ size: max(4, nVis * 4), usage: BU.STORAGE });
+const argsBuf = device.createBuffer({ size: ND * 16, usage: BU.INDIRECT | BU.STORAGE | BU.COPY_DST });
+const diData = new Uint32Array(ND * 64);
+for (let d = 0; d < ND; d++) { diData[d * 64] = base[d]; diData[d * 64 + 1] = DKIND(d); }
+const diBuf = buf(diData, BU.UNIFORM);
+// cull uniforms (struct CU): 0 planes, 20 camera + det, 24 counts, 28 leaf ranges, 32 segment bases, 68 classes, 196 radii
+const CUB = new ArrayBuffer(896), CUF = new Float32Array(CUB), CUU = new Uint32Array(CUB);
+CUU.set([TC.nCl, nSI, nAnim, nLeaf], 24); CUU.set([nBig, nBig + nBigF, nFish, 0], 28); CUU.set(base, 32);
+CLASSES.forEach(([near, far, d0, d1], i) => CUF.set([near, far, d0, d1], 68 + i * 4));
+CUF.set(meshR.slice(0, 26), 196);
+const cullU = device.createBuffer({ size: 896, usage: BU.UNIFORM | BU.COPY_DST });
+const bgCull = device.createBindGroup({ layout: bglCull, entries: [cullU, tbClusters, siAll, clsBuf, aiAll, lbAll, visBuf, argsBuf].map((b, binding) => ({ binding, resource: { buffer: b } })) });
+const geo = [vbAll, ibAll, siAll, aiAll, lbAll].map((b, binding) => ({ binding, resource: { buffer: b } }));
+const bgGeo = device.createBindGroup({ layout: bglGeo, entries: [...geo, { binding: 5, resource: { buffer: visBuf } }] });
+const bgDI = device.createBindGroup({ layout: bglDI, entries: [{ binding: 0, resource: { buffer: diBuf, size: 8 } }] });
+// the visibility pass never changes: record it once
+const visBundle = (() => {
+  const r = device.createRenderBundleEncoder({ colorFormats: [VISF], depthStencilFormat: DEPTH });
+  r.setBindGroup(0, bg0); r.setBindGroup(1, bgGeo);
+  for (let d = 0; d < ND; d++) {
+    if (!cap[d]) continue;
+    const k = DKIND(d); r.setPipeline(k === 0 ? pVisT : k === 1 ? pVisS : k < 4 ? pVisA : pVisL);
+    r.setBindGroup(2, bgDI, [d * 256]); r.drawIndirect(argsBuf, d * 16);
+  }
+  return r.finish();
+})();
 
 // ---------------------------------------------------------------- one-time bakes: detail texture, shadow map
 {
@@ -323,14 +399,14 @@ Q.writeTexture({ texture: tMap }, Wd.gm, { bytesPerRow: 2048 }, [512, 512]);
   r = e.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: tShadow.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
   r.setBindGroup(0, bg0s);
   r.setPipeline(pTerrSh);
-  r.setVertexBuffer(0, vbTerrain); r.setVertexBuffer(1, ibSolids); r.setIndexBuffer(ibTerrain, 'uint32');
-  r.drawIndexed(T.ib.length, 1, 0, 0, nSolid);
-  r.setPipeline(pSolidSh); r.setVertexBuffer(0, vbMesh); r.setIndexBuffer(ibMesh, 'uint32');
-  for (let i = 0; i < 12; i++) { const g = Wd.solids.ranges[i]; if (g[1]) r.drawIndexed(meshes[i].ib.length, g[1], meshes[i].i0, meshes[i].v0, g[0]); }
+  r.setVertexBuffer(0, vbAll); r.setVertexBuffer(1, siAll); r.setIndexBuffer(ibAll, 'uint32');
+  r.drawIndexed(I0, 1, 0, 0, nSolid);
+  r.setPipeline(pSolidSh);
+  for (let i = 0; i < 12; i++) { const g = Wd.solids.ranges[i]; if (g[1]) r.drawIndexed(meshes[i].ib.length, g[1], meshes[i].i0, 0, g[0]); }
   // small rocks, sponges and corals (~35M triangles) only on High: too much for a phone's driver
-  if (!LV) for (let i = 0; i < NCHUNK; i++) { r.setVertexBuffer(1, ibChunk[i]); r.drawIndexed(meshes[14 + i].ib.length, Wd.chunks[i].n, meshes[14 + i].i0, meshes[14 + i].v0, 0); }
-  if (!LV) for (let i = 0; i < 6; i++) if (Wd.props[i].n) { r.setVertexBuffer(1, ibProp[i]); r.drawIndexed(meshes[4 + i].ib.length, Wd.props[i].n, meshes[4 + i].i0, meshes[4 + i].v0, 0); }
-  r.setPipeline(pLeafSh); r.setVertexBuffer(0, ibBig); r.draw(6, Wd.big.n);
+  if (!LV) for (let i = 0; i < NCHUNK; i++) if (Wd.chunks[i].n) r.drawIndexed(meshes[14 + i].ib.length, Wd.chunks[i].n, meshes[14 + i].i0, 0, chunkAt[i]);
+  if (!LV) for (let i = 0; i < 6; i++) if (Wd.props[i].n) r.drawIndexed(meshes[4 + i].ib.length, Wd.props[i].n, meshes[4 + i].i0, 0, propAt[i]);
+  r.setPipeline(pLeafSh); r.setVertexBuffer(0, lbAll); r.draw(6, nBig);
   r.end();
   Q.submit([e.finish()]);
 }
@@ -343,7 +419,9 @@ Wd.glints = Wd.volD = Wd.gm = T.vb = T.ib = T.wp = T.wn = 0;
 // for 60 fps; both start where the last visit left them.
 const PIXMAX = 2560 * 1440, PIXMIN = mob ? 25e4 : 5e5, DETMIN = 0.4;
 let W = 0, H = 0, DW = 0, DH = 0, pix = +SV[1] || (LV > 1 ? 41e4 : mob ? 1280 * 720 : PIXMAX), det = +SV[2] || 1, dynN = 0, dynT = 0, dynG = 0, dynGN = 0, dynBad = 0, dynOk = 0, dynWait = 3;
-let passScene, passRays, passBlur, bgBlur, passPost, bgRays, bgPost, bloomPass = [], bloomBG = [], targets = [];
+let passVis, passScene, passRays, bgRes, bgRays, bloomPass = [], targets = [];
+// ping-pong: [k] reads last frame's history k ^ 1 and writes k
+let passRT = [], bgRT = [], passTAA = [], bgTAA = [], bgPost = [], bgBloom0 = [], ping = 0, taaReset = 1;
 const NB = 6;
 function resize() {
   DW = max(2, round(canvas.clientWidth * devicePixelRatio)); DH = max(2, round(canvas.clientHeight * devicePixelRatio));
@@ -351,32 +429,42 @@ function resize() {
   const w = max(2, round(DW * s) & ~1), h = max(2, round(DH * s) & ~1);
   if (w === W && h === H) return;
   dynN = dynG = dynGN = 0; dynT = -300; // let the new size settle before measuring again
-  W = w; H = h; canvas.width = W; canvas.height = H;
+  W = w; H = h; canvas.width = W; canvas.height = H; taaReset = 1;
   ctx.configure({ device, format: FMT, alphaMode: 'opaque' });
   for (const t of targets) t.destroy();
-  const tMS = tex(AA > 1 ? W : 1, H, HDR, TU.RENDER_ATTACHMENT, { samples: AA }), tDp = tex(W, H, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, { samples: AA });
-  const tRes = tex(W, H, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING), tRay = tex(W / 2, H / 2, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING), tRay2 = tex(W / 2, H / 2, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
-  targets = [tMS, tDp, tRes, tRay, tRay2];
+  const RT = TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING;
+  const tVis = tex(W, H, VISF, RT), tDp = tex(W, H, DEPTH, RT), tRes = tex(W, H, HDR, RT), tRay = tex(W / 2, H / 2, HDR, RT);
+  const tRH = [0, 1].map(() => tex(W / 2, H / 2, HDR, RT)), tHist = [0, 1].map(() => tex(W, H, HDR, RT));
+  targets = [tVis, tDp, tRes, tRay, ...tRH, ...tHist];
   const bl = [];
-  for (let i = 0; i < NB; i++) { const t = tex(max(1, W >> (i + 1)), max(1, H >> (i + 1)), HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING); bl.push(t); targets.push(t); }
-  const vDp = tDp.createView(), vRes = tRes.createView(), vRay = tRay.createView(), vRay2 = tRay2.createView(), vBl = bl.map((t) => t.createView());
-  // without anti-aliasing (Low) the scene goes straight into the resolve target, and tMS is one unused column
-  passScene = { colorAttachments: [{ view: AA > 1 ? tMS.createView() : vRes, resolveTarget: AA > 1 ? vRes : undefined, loadOp: 'clear', storeOp: AA > 1 ? 'discard' : 'store', clearValue: [0, 0, 0, 1] }],
+  for (let i = 0; i < NB; i++) { const t = tex(max(1, W >> (i + 1)), max(1, H >> (i + 1)), HDR, RT); bl.push(t); targets.push(t); }
+  const vDp = tDp.createView(), vRes = tRes.createView(), vRay = tRay.createView(), vRH = tRH.map((t) => t.createView()), vHist = tHist.map((t) => t.createView()), vBl = bl.map((t) => t.createView());
+  passVis = { colorAttachments: [{ view: tVis.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [4294967295, 0, 0, 0] }],
     depthStencilAttachment: { view: vDp, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store' } };
+  passScene = { colorAttachments: [{ view: vRes, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
+    depthStencilAttachment: { view: vDp, depthLoadOp: 'load', depthStoreOp: 'store' } };
+  bgRes = device.createBindGroup({ layout: bglGeoR, entries: [...geo, { binding: 6, resource: tVis.createView() }] });
   passRays = { colorAttachments: [colorAtt(vRay, true)] };
-  passBlur = { colorAttachments: [colorAtt(vRay2, true)] };
-  bgBlur = device.createBindGroup({ layout: pRB.getBindGroupLayout(0), entries: [{ binding: 0, resource: vRay }] });
-  passPost = { colorAttachments: [{ view: null, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] };
   bgRays = device.createBindGroup({ layout: pRays.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ubo } }, { binding: 1, resource: sRep }, { binding: 2, resource: sCmp },
     { binding: 3, resource: tShadow.createView() }, { binding: 4, resource: tWater.createView() }, { binding: 5, resource: vDp }, { binding: 6, resource: tVol.createView() }, { binding: 7, resource: sClamp }] });
-  bgPost = device.createBindGroup({ layout: pPost.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ubo } }, { binding: 1, resource: sClamp }, { binding: 2, resource: vRes },
-    { binding: 3, resource: vRay2 }, { binding: 4, resource: vBl[0] }, { binding: 5, resource: vDp }] });
-  bloomPass = []; bloomBG = [];
-  // down: res -> b0 -> ... -> b5 ; up: b5 -> b4 (additive) ... -> b0
-  for (let i = 0; i < NB; i++) { bloomPass.push({ colorAttachments: [colorAtt(vBl[i], true)] }); bloomBG.push(blitBG(i ? vBl[i - 1] : vRes)); }
+  const ub = { binding: 0, resource: { buffer: ubo } }, sc = { binding: 1, resource: sClamp };
+  for (let k = 0; k < 2; k++) {
+    passRT[k] = { colorAttachments: [colorAtt(vRH[k], true)] };
+    bgRT[k] = device.createBindGroup({ layout: pRT.getBindGroupLayout(0), entries: [ub, sc, { binding: 2, resource: vRay }, { binding: 3, resource: vRH[k ^ 1] }] });
+    passTAA[k] = { colorAttachments: [colorAtt(vHist[k], true)] };
+    bgTAA[k] = device.createBindGroup({ layout: pTAA.getBindGroupLayout(0), entries: [ub, sc, { binding: 2, resource: vRes }, { binding: 3, resource: vHist[k ^ 1] }, { binding: 4, resource: vDp }] });
+    bgPost[k] = device.createBindGroup({ layout: pPost.getBindGroupLayout(0), entries: [ub, sc, { binding: 2, resource: vHist[k] },
+      { binding: 3, resource: vRH[k] }, { binding: 4, resource: vBl[0] }, { binding: 5, resource: vDp }] });
+    bgBloom0[k] = blitBG(vHist[k]);
+  }
+  passPost = { colorAttachments: [{ view: null, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] };
+  // bloom: down hist -> b0 -> ... -> b5 ; up: b5 -> b4 (additive) ... -> b0
+  bloomPass = []; bloomBG = [null];
+  for (let i = 0; i < NB; i++) { bloomPass.push({ colorAttachments: [colorAtt(vBl[i], true)] }); if (i) bloomBG.push(blitBG(vBl[i - 1])); }
   for (let i = NB - 1; i > 0; i--) { bloomPass.push({ colorAttachments: [colorAtt(vBl[i - 1], false)] }); bloomBG.push(blitBG(vBl[i])); }
   UB[52] = W; UB[53] = H; UB[54] = 1 / W; UB[55] = 1 / H;
 }
+let passPost, bloomBG = [];
 resize();
 addEventListener('resize', resize);
 
@@ -403,36 +491,11 @@ let hud = false;
 let kf = 0, kb = 0, kl = 0, kr = 0, ku = 0, kd = 0, ks = 0, mdx = 0, mdy = 0, lkx = 0, lky = 0, l2x = 0, l2y = 0, hN = 0, hMax = 0, hMin = 1e9, hPer = 1e9, hLate = 0, hTot = 0, jx = 0, jy = 0;
 const TANH = 0.6, NEAR = 0.1, EXPO = 0.62, RAYS = 0.54;
 const submitList = [null];
-const rowOrd = new Uint8Array(CELLS);
-// Draws the cells of a cell-sorted buffer that are in view and within [minD, maxD) (scaled by `det`, but not for the
-// terrain) as merged runs, nearest rows first.
-function drawCells(r, start, lo, hi, mar, indexed, verts, minD, maxD) {
-  const cx = F[CX], cy = F[CY], cz = F[CZ], fx = F[FX], fy = F[FY], fz = F[FZ], rx = F[RX], rz = F[RZ], ux = F[UX], uy = F[UY], uz = F[UZ];
-  const ds = indexed === 1 ? 1 : det * det;
-  const tx = TANH * W / H, hw = CELLW * 0.5, ex = hw + mar, min2 = minD * minD * ds, max2 = maxD * maxD * ds;
-  for (let k = 0; k < CELLS; k++) {
-    const rw = rowOrd[k], row = rw * CELLS, pz = OZ + (rw + 0.5) * CELLW - cz, hz = max(abs(pz) - hw, 0);
-    let run = -1;
-    for (let x = 0; x <= CELLS; x++) {
-      const c = row + x; let v = false;
-      if (x < CELLS) {
-        const l = lo[c], h = hi[c];
-        if (l <= h) {
-          const px = OX + (x + 0.5) * CELLW - cx, py = (l + h) * 0.5 - cy, ey = (h - l) * 0.5 + mar, hx = max(abs(px) - hw, 0), h2 = hx * hx + hz * hz;
-          if (h2 < max2 && h2 >= min2) {
-            const lim = px * fx + py * fy + pz * fz + ex * abs(fx) + ey * abs(fy) + ex * abs(fz);
-            if (lim >= 0 && abs(px * rx + pz * rz) - ex * (abs(rx) + abs(rz)) <= lim * tx) v = abs(px * ux + py * uy + pz * uz) - ex * (abs(ux) + abs(uz)) - ey * abs(uy) <= lim * TANH;
-          }
-        }
-      }
-      if (v) { if (run < 0) run = c; } else if (run >= 0) {
-        const a = start[run], n = start[c] - a;
-        if (n > 0) { if (indexed === 1) r.drawIndexed(n * 6, 1, a * 6, 0, nSolid); else if (indexed) r.drawIndexed(indexed.ib.length, n, indexed.i0, indexed.v0, a); else r.draw(verts, n, 0, a); }
-        run = -1;
-      }
-    }
-  }
-}
+// sub-pixel jitter for the temporal anti-aliasing: Halton (2, 3), 8 positions
+const halton = (i, b) => { let f = 1, r = 0; for (; i > 0; i = floor(i / b)) { f /= b; r += f * (i % b); } return r; };
+const JIT = Array.from({ length: 16 }, (_, k) => halton((k >> 1) + 1, k & 1 ? 3 : 2) - 0.5);
+const PVP = new Float32Array(16);
+let nFrame = 0, waterAt = -1e9;
 function render() {
   // camera basis (right vector is horizontal)
   const cx = F[CX], cy = F[CY], cz = F[CZ], pitch = F[PIT], yaw = F[YAW];
@@ -444,6 +507,20 @@ function render() {
   m[1] = ux * sy; m[5] = uy * sy; m[9] = uz * sy; m[13] = -(ux * cx + uy * cy + uz * cz) * sy;
   m[2] = 0; m[6] = 0; m[10] = 0; m[14] = NEAR;
   m[3] = fx; m[7] = fy; m[11] = fz; m[15] = -(fx * cx + fy * cy + fz * cz);
+  // frustum planes for culling (left, right, bottom, top, near), from the matrix before the jitter
+  for (let i = 0; i < 5; i++) {
+    const r = i >> 1, sg = i & 1 ? -1 : 1, k = i < 4 ? 1 : 0;
+    let a = m[3] + sg * m[r] * k, b = m[7] + sg * m[4 + r] * k, c = m[11] + sg * m[8 + r] * k, d = m[15] + sg * m[12 + r] * k;
+    if (i === 4) { a = m[3] - m[2]; b = m[7] - m[6]; c = m[11] - m[10]; d = m[15] - m[14]; }
+    const l = sqrt(a * a + b * b + c * c); CUF[i * 4] = a / l; CUF[i * 4 + 1] = b / l; CUF[i * 4 + 2] = c / l; CUF[i * 4 + 3] = d / l;
+  }
+  CUF[20] = cx; CUF[21] = cy; CUF[22] = cz; CUF[23] = det;
+  // last frame's view-projection, then this frame's with the jitter
+  if (taaReset) PVP.set(m.subarray(0, 16));
+  m.set(PVP, 64); PVP.set(m.subarray(0, 16));
+  const j = (nFrame & 7) * 2, jx = JIT[j] * 2 / W, jy = JIT[j + 1] * 2 / H;
+  for (let c = 0; c < 4; c++) { m[c * 4] += jx * m[c * 4 + 3]; m[c * 4 + 1] += jy * m[c * 4 + 3]; }
+  m[60] = jx; m[61] = jy; m[62] = taaReset; m[63] = (nFrame * 0.618034) % 1;
   m[32] = cx; m[33] = cy; m[34] = cz; m[35] = F[TIME];
   m[36] = rx; m[37] = 0; m[38] = rz; m[39] = TANH * asp;
   m[40] = ux; m[41] = uy; m[42] = uz; m[43] = TANH;
@@ -453,61 +530,57 @@ function render() {
   let ek = (-cy - 8) / 26; ek = ek < 0 ? 0 : ek > 1 ? 1 : ek;
   m[56] = EXPO * (0.6 + 0.4 * ek); m[57] = RAYS; m[58] = det;
   Q.writeBuffer(ubo, 0, UB);
-  WT[0] = F[TIME]; Q.writeBuffer(uboW, 0, WT);
+  Q.writeBuffer(cullU, 0, CUB);
+  Q.writeBuffer(argsBuf, 0, ARGT); // the visible counts start at 0
 
-  { let cr = floor((cz - OZ) / CELLW) | 0; cr = cr < 0 ? 0 : cr > CELLS - 1 ? CELLS - 1 : cr; let n = 0; rowOrd[n++] = cr; for (let d = 1; d < CELLS; d++) { if (cr - d >= 0) rowOrd[n++] = cr - d; if (cr + d < CELLS) rowOrd[n++] = cr + d; } }
   const e = device.createCommandEncoder();
   let slot = null;
   if (hasTS) { for (let i = 0; i < qRead.length; i++) if (!qRead[i].busy) { slot = qRead[i]; break; } }
-  waterPass[0].timestampWrites = slot ? tsBegin : undefined;
   passPost.timestampWrites = slot ? tsEnd : undefined;
-  // animated water texture + mips
-  let r = e.beginRenderPass(waterPass[0]); r.setPipeline(pWater); r.setBindGroup(0, bgWater); r.draw(3); r.end();
-  for (let i = 1; i < 5; i++) { r = e.beginRenderPass(waterPass[i]); r.setPipeline(pMip16); r.setBindGroup(0, waterBG[i - 1]); r.draw(3); r.end(); }
-  // scene
+  // culling
+  const c = e.beginComputePass(slot ? { timestampWrites: tsBegin } : undefined);
+  c.setBindGroup(0, bgCull);
+  c.setPipeline(pCullT); c.dispatchWorkgroups(ceil(TC.nCl / 64));
+  c.setPipeline(pCullS); c.dispatchWorkgroups(ceil(nSI / 64));
+  c.setPipeline(pCullA); c.dispatchWorkgroups(ceil(nAnim / 64));
+  c.setPipeline(pCullL); c.dispatchWorkgroups(ceil(nLeaf / 64));
+  c.end();
+  // animated water texture + mips, at most ~60 times a second
+  let r;
+  if (F[LAST] - waterAt > 15.5 || F[LAST] < waterAt) {
+    waterAt = F[LAST]; WT[0] = F[TIME]; Q.writeBuffer(uboW, 0, WT);
+    r = e.beginRenderPass(waterPass[0]); r.setPipeline(pWater); r.setBindGroup(0, bgWater); r.draw(3); r.end();
+    for (let i = 1; i < 5; i++) { r = e.beginRenderPass(waterPass[i]); r.setPipeline(pMip16); r.setBindGroup(0, waterBG[i - 1]); r.draw(3); r.end(); }
+  }
+  // visibility buffer, then each pixel shaded once; the water, the background and the sprites forward on top
+  r = e.beginRenderPass(passVis); r.executeBundles([visBundle]); r.end();
   r = e.beginRenderPass(passScene);
-  r.setBindGroup(0, bg0);
-  r.setPipeline(pTerrain); r.setVertexBuffer(0, vbTerrain); r.setVertexBuffer(1, ibSolids); r.setIndexBuffer(ibTerrain, 'uint32');
-  drawCells(r, T.start, T.lo, T.hi, 1.5, 1, 0, 0, 240);
-  r.setPipeline(pSolid); r.setVertexBuffer(0, vbMesh); r.setIndexBuffer(ibMesh, 'uint32');
-  for (let i = 0; i < 12; i++) { const g = Wd.solids.ranges[i]; if (g[1]) r.drawIndexed(meshes[i].ib.length, g[1], meshes[i].i0, meshes[i].v0, g[0]); }
-  for (let i = 0; i < NCHUNK; i++) {
-    const c = Wd.chunks[i], big = i > 2 && i < 6; r.setVertexBuffer(1, ibChunk[i]);
-    drawCells(r, c.start, c.lo, c.hi, 3, meshes[14 + i], 0, 0, i > 5 ? 30 : big ? 40 : 96);
-    if (big) drawCells(r, c.start, c.lo, c.hi, 3, meshes[20 + i], 0, 40, 150);
-  }
-  for (let i = 0; i < 6; i++) {
-    const lod = i === 3 || i === 4; r.setVertexBuffer(1, ibProp[i]);
-    drawCells(r, Wd.props[i].start, Wd.props[i].lo, Wd.props[i].hi, 3, meshes[4 + i], 0, 0, lod ? 6 : 110);
-    if (lod) drawCells(r, Wd.props[i].start, Wd.props[i].lo, Wd.props[i].hi, 3, meshes[18 + i], 0, 6, 110);
-  }
-  r.setPipeline(pManta); r.setVertexBuffer(1, ibManta); r.drawIndexed(MANTA.ib.length, nManta, MANTA.i0, MANTA.v0, 0);
-  r.setPipeline(pFish); r.setVertexBuffer(1, ibFish); r.drawIndexed(FISH.ib.length, nFish, FISH.i0, FISH.v0, 0);
-  // kelp and plants: 9-row blades up close, 5 rows mid-range, a decimated set far away
-  r.setPipeline(pLeaf); r.setVertexBuffer(0, ibBig); drawCells(r, Wd.big.start, Wd.big.lo, Wd.big.hi, 5, false, 18, 0, 24);
-  r.setPipeline(pLeaf5); drawCells(r, Wd.big.start, Wd.big.lo, Wd.big.hi, 5, false, 10, 24, 58);
-  r.setPipeline(pLeafF); r.setVertexBuffer(0, ibBigF); drawCells(r, Wd.bigF.start, Wd.bigF.lo, Wd.bigF.hi, 5, false, 6, 58, 150);
-  r.setPipeline(pLeafS); r.setVertexBuffer(0, ibSmall); drawCells(r, Wd.small.start, Wd.small.lo, Wd.small.hi, 1.5, false, 6, 0, 70);
+  r.setBindGroup(0, bg0); r.setBindGroup(1, bgRes);
+  r.setPipeline(pRes); r.draw(3);
   r.setPipeline(pSurf); r.draw(4);
   r.setPipeline(pBack); r.draw(4);
   r.setPipeline(pBub); r.setVertexBuffer(0, ibBubbles); r.draw(4, nBub);
   r.setPipeline(pGl); r.setVertexBuffer(0, ibGl); r.draw(4, nGl);
   r.setPipeline(pSnow); r.setVertexBuffer(0, ibSnowB); r.draw(4, nSnow);
   r.end();
-  // light shafts
+  const k = ping ^= 1;
+  // light shafts (half res), accumulated over frames
   r = e.beginRenderPass(passRays); r.setPipeline(pRays); r.setBindGroup(0, bgRays); r.draw(3); r.end();
-  r = e.beginRenderPass(passBlur); r.setPipeline(pRB); r.setBindGroup(0, bgBlur); r.draw(3); r.end();
+  r = e.beginRenderPass(passRT[k]); r.setPipeline(pRT); r.setBindGroup(0, bgRT[k]); r.draw(3); r.end();
+  // temporal anti-aliasing
+  r = e.beginRenderPass(passTAA[k]); r.setPipeline(pTAA); r.setBindGroup(0, bgTAA[k]); r.draw(3); r.end();
   // bloom
   for (let i = 0; i < bloomPass.length; i++) {
-    r = e.beginRenderPass(bloomPass[i]); r.setPipeline(i === 0 ? pDown0 : i < NB ? pDown : pUp); r.setBindGroup(0, bloomBG[i]); r.draw(3); r.end();
+    r = e.beginRenderPass(bloomPass[i]); r.setPipeline(i === 0 ? pDown0 : i < NB ? pDown : pUp); r.setBindGroup(0, i ? bloomBG[i] : bgBloom0[k]); r.draw(3); r.end();
   }
   // composite
   passPost.colorAttachments[0].view = ctx.getCurrentTexture().createView();
-  r = e.beginRenderPass(passPost); r.setPipeline(pPost); r.setBindGroup(0, bgPost); r.draw(3); r.end();
+  r = e.beginRenderPass(passPost); r.setPipeline(pPost); r.setBindGroup(0, bgPost[k]); r.draw(3); r.end();
   if (slot) { e.resolveQuerySet(qs, 0, 2, qResolve, 0); e.copyBufferToBuffer(qResolve, 0, slot.b, 0, 16); }
   submitList[0] = e.finish();
   Q.submit(submitList);
   if (slot) { slot.busy = true; slot.b.mapAsync(GPUMapMode.READ).then(slot.done); }
+  nFrame++; taaReset = 0;
 }
 
 // CS[j] = distance to the rock (metres, < 0 in water) at the camera + CE[3j..3j+2]: the camera, then ±0.375 m on
