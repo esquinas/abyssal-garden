@@ -81,6 +81,33 @@ function buildTerrain(D) {
   return { vb, ib, nv, wp, wn, smp, start: cnt, lo, hi };
 }
 
+// Regroups the terrain's quads into clusters of 128 nearby quads (256 triangles) that the GPU culls one by one: sorted
+// by 6 m brick (bricks in Morton order over XZ, then by height) and padded with empty triangles to whole clusters.
+// Returns the indices (768 per cluster) and each cluster's box (min xyz, 0, max xyz, 0).
+function clusterTerrain(T) {
+  const nq = T.ib.length / 6, key = new Uint32Array(nq), cnt = new Uint32Array(65537), wp = T.wp;
+  const mort = (v) => { v = (v | (v << 4)) & 0x0f0f0f0f; v = (v | (v << 2)) & 0x33333333; return (v | (v << 1)) & 0x55555555; };
+  for (let q = 0; q < nq; q++) {
+    const a = T.ib[q * 6] * 3;
+    const bx = clamp(floor((wp[a] - OX) / 6), 0, 63), by = clamp(floor((wp[a + 1] - OY) / 6), 0, 15), bz = clamp(floor((wp[a + 2] - OZ) / 6), 0, 63);
+    key[q] = (((mort(bx) | (mort(bz) << 1)) << 4) | by); cnt[key[q] + 1]++;
+  }
+  for (let k = 0; k < 65536; k++) cnt[k + 1] += cnt[k];
+  const order = new Uint32Array(nq);
+  for (let q = 0; q < nq; q++) order[cnt[key[q]]++] = q;
+  const nCl = Math.ceil(nq / 128), ib = new Uint32Array(nCl * 768), box = new Float32Array(nCl * 8);
+  for (let i = 0; i < nq; i++) { const q = order[i] * 6; for (let j = 0; j < 6; j++) ib[i * 6 + j] = T.ib[q + j]; }
+  for (let c = 0; c < nCl; c++) {
+    let x0 = 1e9, y0 = 1e9, z0 = 1e9, x1 = -1e9, y1 = -1e9, z1 = -1e9;
+    for (let i = c * 768, e = min(nq * 6, i + 768); i < e; i++) {
+      const v = ib[i] * 3, x = wp[v], y = wp[v + 1], z = wp[v + 2];
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; if (z < z0) z0 = z; if (z > z1) z1 = z;
+    }
+    box.set([x0, y0, z0, 0, x1, y1, z1, 0], c * 8);
+  }
+  return { ib, nCl, box };
+}
+
 // ---------------------------------------------------------------- instance stores
 function makeWorld(D, T, flyPts, POSES) {
   const gi = (x, y, z) => x + NX * (y + NY * z);

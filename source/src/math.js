@@ -1,7 +1,7 @@
 // ============================================================================
 // math + procedural helpers (load-time only unless noted)
 // ============================================================================
-const { sin, cos, sqrt, min, max, abs, floor, PI, pow, atan2, hypot, exp, round } = Math;
+const { sin, cos, sqrt, min, max, abs, floor, ceil, PI, pow, atan2, hypot, exp, round } = Math;
 const TAU = PI * 2;
 let _seed = 20261110;
 const rnd = () => {

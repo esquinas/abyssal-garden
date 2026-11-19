@@ -3,7 +3,7 @@
 **A dreamy underwater world you can swim through, right in your browser.**
 
 Towering kelp forests, sunbeams pouring through a rippling surface, a sunken ship, manta rays gliding overhead.
-And all of it is made by code: no images, no 3D models, no sound files. The whole world fits in **one 96 KB HTML file**.
+And all of it is made by code: no images, no 3D models, no sound files. The whole world fits in **one 117 KB HTML file**.
 
 ![Kelp forest with a stone whale tail and a manta ray](.github/screenshots/whale-fluke.jpg)
 
@@ -57,7 +57,7 @@ The **Low**, **Medium** and **High** buttons in the menu pick the detail level; 
 |---|---|---|
 | **High** | The full scene | Computers |
 | **Medium** | Half of the leaves, sparkles and pebbles; small rocks, sponges and corals cast no shadows | Phones with 8 GB of memory |
-| **Low** | A quarter of the leaves, no anti-aliasing, coarser rocks and corals, simpler lighting, 480p to start with | Other phones, and computers with 4 GB of memory or less |
+| **Low** | A quarter of the leaves, coarser rocks and corals, simpler lighting, fewer light-ray steps, 480p to start with | Other phones, and computers with 4 GB of memory or less |
 
 Changing the level restarts the page. High can be too much for a phone. If loading crashes the tab, or the graphics driver gives up, the page starts again one level lower. Your browser remembers the level, and the resolution and draw distance the scene settled on, for the next visit.
 
@@ -65,6 +65,8 @@ Changing the level restarts the page. High can be too much for a phone. If loadi
 
 - The seabed is sculpted on your graphics card every time the page opens, then decorated with about two million kelp leaves and plants, tens of thousands of rocks, and thousands of sponges, corals and fish.
 - Everything is drawn with **WebGPU** directly. No game engine or 3D library is used.
+- The graphics card decides what to draw by itself: every frame, compute shaders check each patch of seabed, rock, fish and leaf against the view and against what is already in front of it, and pick how detailed to draw it.
+- Each pixel is lit only once: the scene is first drawn as a *visibility buffer* that only records which triangle is where, and a second pass lights each pixel from that. Edges are smoothed over several frames (temporal anti-aliasing).
 - The ship, whale tail, mantas, fish and corals are built from simple mathematical shapes.
 - The sound is synthesized live with the Web Audio API.
 - It's built to run smoothly: about 180 fps at 2560×1440 on an RTX 5070 Ti. On slower hardware it aims for 60 fps by lowering first the resolution and then how far away plants and rocks are drawn, in small steps. The scene is already running, blurred, behind the start menu, so most of that tuning is done before you dive in. A low-end phone (Samsung Galaxy A16) reaches about 20 fps at 670×372 on Low.
@@ -81,7 +83,7 @@ npm run build
 
 This writes a new `index.html` next to this README. `npm run build:readable` writes an unminified version instead, which is easier to debug in the browser's developer tools.
 
-`npm run build:dev` writes a separate `dev.html` with two extra tools that are not part of `index.html`: `F` flies the camera along a one-minute path through the whole world, and `B` runs that flight as a benchmark and reports frame and GPU times.
+`npm run build:dev` writes a separate `dev.html` with two extra tools that are not part of `index.html`: `F` flies the camera along a one-minute path through the whole world, and `B` runs that flight as a benchmark and reports frame and GPU times. It also exposes `window.ag`, a small hook for scripted captures (jump to a viewpoint, freeze time, render frames and read their GPU time).
 
 | File | What's inside |
 |---|---|

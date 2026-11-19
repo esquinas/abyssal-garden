@@ -16,7 +16,10 @@
   };
   // frame() moves the free camera and then calls render(): step in between and put the camera on the path instead
   const draw = render;
-  render = () => {
+  let frozen = null, paused = false; // ag.freeze(t): every frame renders at time t; paused: only ag.frames() draws
+  render = (own) => {
+    if (paused && own !== 1) return;
+    if (frozen !== null) F[TIME] = frozen;
     if (flying) {
       const dtr = F[LAST] - last; last = F[LAST];
       F[FLT] += min(dtr / 1000, 0.1); flyAt();
@@ -36,4 +39,16 @@
       }
     } else if (/Digit[1-6]/.test(e.code)) stop();
   });
+  // automation hook for headless captures (Playwright): pose, freeze time, hold the resolution, read GPU time
+  window.ag = {
+    ready: true,
+    pose: (i) => lookAt(...POSES[i]),
+    freeze: (t) => { frozen = t; },
+    hold: () => { dynT = -Infinity; paused = true; },
+    hide: () => { menu = false; body.className = 'g'; },
+    // render n frames, return the GPU times (ms) measured meanwhile
+    frames: async (n) => { const out = []; for (let i = 0; i < n; i++) { F[GPU] = 0; F[LAST] = performance.now(); render(1); await Q.onSubmittedWorkDone(); await new Promise((r) => setTimeout(r, 20)); if (F[GPU] > 0) out.push(F[GPU]); } return out; },
+    size: () => [W, H],
+    stats: () => ({ vertices: nV, indices: nI, clusters: nCl, solids: nSI, leaves: nLeaf, animals: nAnim, visCapacity: nVis }),
+  };
 }
