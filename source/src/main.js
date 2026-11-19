@@ -116,7 +116,7 @@ const bglDI = device.createBindGroupLayout({ entries: [{ binding: 0, visibility:
 const plVis = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bglGeo, bglDI] }), plRes = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bglGeoR] });
 const bglCull = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: SS.COMPUTE, buffer: {} },
   ...[1, 2, 3, 4, 5].map((binding) => ({ binding, visibility: SS.COMPUTE, buffer: RO })),
-  { binding: 6, visibility: SS.COMPUTE, buffer: { type: 'storage' } }, { binding: 7, visibility: SS.COMPUTE, buffer: { type: 'storage' } }] });
+  ...[6, 7, 8].map((binding) => ({ binding, visibility: SS.COMPUTE, buffer: { type: 'storage' } })), { binding: 9, visibility: SS.COMPUTE, texture: { sampleType: 'unfilterable-float' } }] });
 
 await say('Compiling shaders…', 0.05, 300);
 const mScene = mod(W_SCENE), mLeaf = mod(W_LEAF), mSurf = mod(W_SURF), mSpr = mod(W_SPR), mCull = mod(W_CULL);
@@ -132,7 +132,9 @@ const pGl = scenePipe(mLeaf, 'vsGl', 'fsGl', [ibBub], { strip: true, blend: ADD 
 const pSolidSh = shadowPipe(mScene, 'vsSh', [vbSolid, ibSolid]), pTerrSh = shadowPipe(mScene, 'vsSh', [vbSolid, ibSolid], { cull: 'front' });
 const pLeafSh = shadowPipe(mLeaf, 'vs', [ibLeaf], { strip: true, constants: { ROWS: 3 } });
 const plCull = device.createPipelineLayout({ bindGroupLayouts: [bglCull] });
-const [pCullT, pCullS, pCullA, pCullL] = ['cullT', 'cullS', 'cullA', 'cullL'].map((entryPoint) => device.createComputePipeline({ layout: plCull, compute: { module: mCull, entryPoint } }));
+// [phase 1, phase 2] of each culling pass
+const [pCullT, pCullS, pCullA, pCullL] = ['cullT', 'cullS', 'cullA', 'cullL'].map((entryPoint) => [1, 2].map((PHASE) => device.createComputePipeline({ layout: plCull, compute: { module: mCull, entryPoint, constants: { PHASE } } })));
+const mHzb = mod(W_HZB), [pHz0, pHzN] = ['mip0', 'mipN'].map((entryPoint) => device.createComputePipeline({ layout: 'auto', compute: { module: mHzb, entryPoint } }));
 
 const mWater = mod(W_WATER);
 const pWater = device.createRenderPipeline({ layout: 'auto', vertex: { module: mWater, entryPoint: 'vs' }, fragment: { module: mWater, entryPoint: 'fs', targets: [{ format: HDR }] } });
@@ -348,8 +350,9 @@ Q.writeTexture({ texture: tMap }, Wd.gm, { bytesPerRow: 2048 }, [512, 512]);
 // ---------------------------------------------------------------- draws (GPU-driven)
 // 33 indirect draws: 0 terrain clusters, 1 + m solid mesh m, 27 fish, 28 mantas, 29-32 leaves (9, 5 and 3 rows of the
 // near set, the far set, the small plants). The cull pass fills each draw's segment of the visible list and its count.
-const ND = 33, DKIND = (d) => d === 0 ? 0 : d < 27 ? 1 : d < 29 ? d - 25 : d - 25;
-const cap = new Uint32Array(ND), ARGT = new Uint32Array(ND * 4);
+// Draws 33-65 are the same for the second occlusion phase (see W_CULL), with segments of their own.
+const ND = 33, DKIND = (d) => d === 0 ? 0 : d < 27 ? 1 : d - 25;
+const cap = new Uint32Array(ND), ARGT = new Uint32Array(ND * 8);
 cap[0] = TC.nCl; ARGT.set([768, 0, 0, 0], 0);
 for (const [near, far, , , n] of CLASSES) { cap[1 + near] += n; if (far >= 0) cap[1 + far] += n; }
 for (let m = 0; m < 26; m++) ARGT.set([meshes[m].ib.length, 0, meshes[m].i0, 0], (1 + m) * 4);
@@ -357,34 +360,39 @@ cap[27] = nFish; ARGT.set([FISH.ib.length, 0, FISH.i0, 0], 27 * 4);
 cap[28] = nManta; ARGT.set([MANTA.ib.length, 0, MANTA.i0, 0], 28 * 4);
 cap[29] = cap[30] = nBig; cap[31] = nBigF; cap[32] = Wd.small.n;
 [18, 10, 6, 6].forEach((v, i) => ARGT.set([v, 0, 0, 0], (29 + i) * 4));
-const base = new Uint32Array(ND); let nVis = 0;
-for (let d = 0; d < ND; d++) { base[d] = nVis; nVis += cap[d]; }
+ARGT.copyWithin(ND * 4, 0, ND * 4);
+const base = new Uint32Array(ND * 2); let nVis = 0;
+for (let d = 0; d < ND * 2; d++) { base[d] = nVis; nVis += cap[d % ND]; }
 const visBuf = device.createBuffer({ size: max(4, nVis * 4), usage: BU.STORAGE });
-const argsBuf = device.createBuffer({ size: ND * 16, usage: BU.INDIRECT | BU.STORAGE | BU.COPY_DST });
-const diData = new Uint32Array(ND * 64);
-for (let d = 0; d < ND; d++) { diData[d * 64] = base[d]; diData[d * 64 + 1] = DKIND(d); }
+const argsBuf = device.createBuffer({ size: ND * 32, usage: BU.INDIRECT | BU.STORAGE | BU.COPY_DST });
+// one word per culled object (clusters, solids, animals, leaves): seen last frame
+const vbBits = device.createBuffer({ size: (TC.nCl + nSI + nAnim + nLeaf) * 4, usage: BU.STORAGE });
+const diData = new Uint32Array(ND * 128);
+for (let d = 0; d < ND * 2; d++) { diData[d * 64] = base[d]; diData[d * 64 + 1] = DKIND(d % ND); }
 const diBuf = buf(diData, BU.UNIFORM);
-// cull uniforms (struct CU): 0 planes, 20 camera + det, 24 counts, 28 leaf ranges, 32 segment bases, 68 classes, 196 radii
-const CUB = new ArrayBuffer(896), CUF = new Float32Array(CUB), CUU = new Uint32Array(CUB);
+// cull uniforms (struct CU): 0 planes, 20 camera + det, 24 counts, 28 leaf ranges, 32 segment bases, 100 classes,
+// 228 radii, 256 view-projection, 272 pyramid, 276 offsets in vbBits
+const CUB = new ArrayBuffer(1120), CUF = new Float32Array(CUB), CUU = new Uint32Array(CUB);
 CUU.set([TC.nCl, nSI, nAnim, nLeaf], 24); CUU.set([nBig, nBig + nBigF, nFish, 0], 28); CUU.set(base, 32);
-CLASSES.forEach(([near, far, d0, d1], i) => CUF.set([near, far, d0, d1], 68 + i * 4));
-CUF.set(meshR.slice(0, 26), 196);
-const cullU = device.createBuffer({ size: 896, usage: BU.UNIFORM | BU.COPY_DST });
-const bgCull = device.createBindGroup({ layout: bglCull, entries: [cullU, tbClusters, siAll, clsBuf, aiAll, lbAll, visBuf, argsBuf].map((b, binding) => ({ binding, resource: { buffer: b } })) });
+CLASSES.forEach(([near, far, d0, d1], i) => CUF.set([near, far, d0, d1], 100 + i * 4));
+CUF.set(meshR.slice(0, 26), 228);
+CUU.set([TC.nCl, TC.nCl + nSI, TC.nCl + nSI + nAnim, 0], 276);
+const cullU = device.createBuffer({ size: CUB.byteLength, usage: BU.UNIFORM | BU.COPY_DST });
+const cullEntries = [cullU, tbClusters, siAll, clsBuf, aiAll, lbAll, visBuf, argsBuf, vbBits].map((b, binding) => ({ binding, resource: { buffer: b } }));
 const geo = [vbAll, ibAll, siAll, aiAll, lbAll].map((b, binding) => ({ binding, resource: { buffer: b } }));
 const bgGeo = device.createBindGroup({ layout: bglGeo, entries: [...geo, { binding: 5, resource: { buffer: visBuf } }] });
 const bgDI = device.createBindGroup({ layout: bglDI, entries: [{ binding: 0, resource: { buffer: diBuf, size: 8 } }] });
-// the visibility pass never changes: record it once
-const visBundle = (() => {
+// the visibility passes never change: record them once
+const visBundle = [0, ND].map((d0) => {
   const r = device.createRenderBundleEncoder({ colorFormats: [VISF], depthStencilFormat: DEPTH });
   r.setBindGroup(0, bg0); r.setBindGroup(1, bgGeo);
   for (let d = 0; d < ND; d++) {
     if (!cap[d]) continue;
     const k = DKIND(d); r.setPipeline(k === 0 ? pVisT : k === 1 ? pVisS : k < 4 ? pVisA : pVisL);
-    r.setBindGroup(2, bgDI, [d * 256]); r.drawIndirect(argsBuf, d * 16);
+    r.setBindGroup(2, bgDI, [(d0 + d) * 256]); r.drawIndirect(argsBuf, (d0 + d) * 16);
   }
   return r.finish();
-})();
+});
 
 // ---------------------------------------------------------------- one-time bakes: detail texture, shadow map
 {
@@ -419,7 +427,7 @@ Wd.glints = Wd.volD = Wd.gm = T.vb = T.ib = T.wp = T.wn = 0;
 // for 60 fps; both start where the last visit left them.
 const PIXMAX = 2560 * 1440, PIXMIN = mob ? 25e4 : 5e5, DETMIN = 0.4;
 let W = 0, H = 0, DW = 0, DH = 0, pix = +SV[1] || (LV > 1 ? 41e4 : mob ? 1280 * 720 : PIXMAX), det = +SV[2] || 1, dynN = 0, dynT = 0, dynG = 0, dynGN = 0, dynBad = 0, dynOk = 0, dynWait = 3;
-let passVis, passScene, passRays, bgRes, bgRays, bloomPass = [], targets = [];
+let passVis, passVis2, passScene, passRays, bgRes, bgRays, bgCull, hzbSteps = [], bloomPass = [], targets = [];
 // ping-pong: [k] reads last frame's history k ^ 1 and writes k
 let passRT = [], bgRT = [], passTAA = [], bgTAA = [], bgPost = [], bgBloom0 = [], ping = 0, taaReset = 1;
 const NB = 6;
@@ -441,6 +449,19 @@ function resize() {
   const vDp = tDp.createView(), vRes = tRes.createView(), vRay = tRay.createView(), vRH = tRH.map((t) => t.createView()), vHist = tHist.map((t) => t.createView()), vBl = bl.map((t) => t.createView());
   passVis = { colorAttachments: [{ view: tVis.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [4294967295, 0, 0, 0] }],
     depthStencilAttachment: { view: vDp, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store' } };
+  passVis2 = { colorAttachments: [{ ...passVis.colorAttachments[0], loadOp: 'load' }], depthStencilAttachment: { view: vDp, depthLoadOp: 'load', depthStoreOp: 'store' } };
+  // depth pyramid: level 0 is half the size of the screen
+  const hw = W / 2, hh = H / 2, nL = floor(Math.log2(max(hw, hh))) + 1;
+  const tHz = device.createTexture({ size: [hw, hh], format: 'r32float', mipLevelCount: nL, usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING });
+  targets.push(tHz);
+  const hzV = (l) => tHz.createView({ baseMipLevel: l, mipLevelCount: 1 });
+  hzbSteps = [];
+  for (let l = 0; l < nL; l++) {
+    const p = l ? pHzN : pHz0, entries = [{ binding: 1, resource: hzV(l) }, l ? { binding: 0, resource: hzV(l - 1) } : { binding: 2, resource: vDp }];
+    hzbSteps.push([p, device.createBindGroup({ layout: p.getBindGroupLayout(0), entries }), ceil(max(1, hw >> l) / 8), ceil(max(1, hh >> l) / 8)]);
+  }
+  CUF[272] = W; CUF[273] = H; CUF[274] = nL;
+  bgCull = device.createBindGroup({ layout: bglCull, entries: [...cullEntries, { binding: 9, resource: tHz.createView() }] });
   passScene = { colorAttachments: [{ view: vRes, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
     depthStencilAttachment: { view: vDp, depthLoadOp: 'load', depthStoreOp: 'store' } };
   bgRes = device.createBindGroup({ layout: bglGeoR, entries: [...geo, { binding: 6, resource: tVis.createView() }] });
@@ -496,6 +517,13 @@ const halton = (i, b) => { let f = 1, r = 0; for (; i > 0; i = floor(i / b)) { f
 const JIT = Array.from({ length: 16 }, (_, k) => halton((k >> 1) + 1, k & 1 ? 3 : 2) - 0.5);
 const PVP = new Float32Array(16);
 let nFrame = 0, waterAt = -1e9;
+function cull(c, ph) {
+  c.setBindGroup(0, bgCull);
+  c.setPipeline(pCullT[ph]); c.dispatchWorkgroups(ceil(TC.nCl / 64));
+  c.setPipeline(pCullS[ph]); c.dispatchWorkgroups(ceil(nSI / 64));
+  c.setPipeline(pCullA[ph]); c.dispatchWorkgroups(ceil(nAnim / 64));
+  c.setPipeline(pCullL[ph]); c.dispatchWorkgroups(ceil(nLeaf / 64));
+}
 function render() {
   // camera basis (right vector is horizontal)
   const cx = F[CX], cy = F[CY], cz = F[CZ], pitch = F[PIT], yaw = F[YAW];
@@ -514,7 +542,7 @@ function render() {
     if (i === 4) { a = m[3] - m[2]; b = m[7] - m[6]; c = m[11] - m[10]; d = m[15] - m[14]; }
     const l = sqrt(a * a + b * b + c * c); CUF[i * 4] = a / l; CUF[i * 4 + 1] = b / l; CUF[i * 4 + 2] = c / l; CUF[i * 4 + 3] = d / l;
   }
-  CUF[20] = cx; CUF[21] = cy; CUF[22] = cz; CUF[23] = det;
+  CUF[20] = cx; CUF[21] = cy; CUF[22] = cz; CUF[23] = det; CUF.set(m.subarray(0, 16), 256);
   // last frame's view-projection, then this frame's with the jitter
   if (taaReset) PVP.set(m.subarray(0, 16));
   m.set(PVP, 64); PVP.set(m.subarray(0, 16));
@@ -537,14 +565,9 @@ function render() {
   let slot = null;
   if (hasTS) { for (let i = 0; i < qRead.length; i++) if (!qRead[i].busy) { slot = qRead[i]; break; } }
   passPost.timestampWrites = slot ? tsEnd : undefined;
-  // culling
-  const c = e.beginComputePass(slot ? { timestampWrites: tsBegin } : undefined);
-  c.setBindGroup(0, bgCull);
-  c.setPipeline(pCullT); c.dispatchWorkgroups(ceil(TC.nCl / 64));
-  c.setPipeline(pCullS); c.dispatchWorkgroups(ceil(nSI / 64));
-  c.setPipeline(pCullA); c.dispatchWorkgroups(ceil(nAnim / 64));
-  c.setPipeline(pCullL); c.dispatchWorkgroups(ceil(nLeaf / 64));
-  c.end();
+  // culling, phase 1: what was seen last frame
+  let c = e.beginComputePass(slot ? { timestampWrites: tsBegin } : undefined);
+  cull(c, 0); c.end();
   // animated water texture + mips, at most ~60 times a second
   let r;
   if (F[LAST] - waterAt > 15.5 || F[LAST] < waterAt) {
@@ -552,8 +575,13 @@ function render() {
     r = e.beginRenderPass(waterPass[0]); r.setPipeline(pWater); r.setBindGroup(0, bgWater); r.draw(3); r.end();
     for (let i = 1; i < 5; i++) { r = e.beginRenderPass(waterPass[i]); r.setPipeline(pMip16); r.setBindGroup(0, waterBG[i - 1]); r.draw(3); r.end(); }
   }
-  // visibility buffer, then each pixel shaded once; the water, the background and the sprites forward on top
-  r = e.beginRenderPass(passVis); r.executeBundles([visBundle]); r.end();
+  // visibility buffer: phase 1's draws, the depth pyramid of what they cover, phase 2 (the rest that is not hidden
+  // behind it) on top. Then each pixel is shaded once; the water, the background and the sprites forward on top.
+  r = e.beginRenderPass(passVis); r.executeBundles([visBundle[0]]); r.end();
+  c = e.beginComputePass();
+  for (const [p, bg, x, y] of hzbSteps) { c.setPipeline(p); c.setBindGroup(0, bg); c.dispatchWorkgroups(x, y); }
+  cull(c, 1); c.end();
+  r = e.beginRenderPass(passVis2); r.executeBundles([visBundle[1]]); r.end();
   r = e.beginRenderPass(passScene);
   r.setBindGroup(0, bg0); r.setBindGroup(1, bgRes);
   r.setPipeline(pRes); r.draw(3);

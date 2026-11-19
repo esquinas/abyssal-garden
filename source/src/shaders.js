@@ -708,13 +708,19 @@ struct VI { @location(0) p: vec3f, @location(1) n: vec4f, @location(2) a: vec4f,
 // Tests every terrain cluster and instance against the view frustum and its draw distance (scaled by the detail
 // `det`), picks a level of detail and appends what is visible to its draw's segment of VIS, counting it in the
 // draw's indirect arguments. Draws: 0 terrain, 1 + m solid mesh m, 27 fish, 28 mantas, 29-32 leaf kinds 4-7.
+// Occlusion in two phases (PHASE): 1 draws what was visible last frame (VB, one word per object), without testing it;
+// then a depth pyramid (HZB) is built from what that drew, and 2 tests everything against it, keeps the result for
+// the next frame and draws what 1 left out (draws 33-65, the same order).
 const W_CULL = /*wgsl*/`
+override PHASE: u32 = 1u;
 struct SI_ { a: vec4f, b: vec4f, c: vec4f };
 struct AI_ { a: vec4f, b: vec4f };
 // pl: frustum planes; cam: camera, w = det; n: clusters, solids, animals, leaves; ln: end of the near leaves, end of
 // the far leaves, number of fish; base: segment of VIS per draw; cls: per solid class near mesh, far mesh (< 0 none),
-// near and far distance (< 0: no limit); rad: bounding radius per mesh
-struct CU { pl: array<vec4f, 5>, cam: vec4f, n: vec4u, ln: vec4u, base: array<vec4u, 9>, cls: array<vec4f, 32>, rad: array<vec4f, 7> };
+// near and far distance (< 0: no limit); rad: bounding radius per mesh; vp: view-projection (no jitter);
+// hz: screen size, pyramid levels; vo: where the solids, animals and leaves start in VB
+struct CU { pl: array<vec4f, 5>, cam: vec4f, n: vec4u, ln: vec4u, base: array<vec4u, 17>, cls: array<vec4f, 32>, rad: array<vec4f, 7>,
+  vp: mat4x4f, hz: vec4f, vo: vec4u };
 @group(0) @binding(0) var<uniform> u: CU;
 @group(0) @binding(1) var<storage, read> TB: array<vec4f>;
 @group(0) @binding(2) var<storage, read> SIB: array<SI_>;
@@ -723,47 +729,108 @@ struct CU { pl: array<vec4f, 5>, cam: vec4f, n: vec4u, ln: vec4u, base: array<ve
 @group(0) @binding(5) var<storage, read> LB: array<u32>;
 @group(0) @binding(6) var<storage, read_write> VIS: array<u32>;
 @group(0) @binding(7) var<storage, read_write> ARGS: array<atomic<u32>>;
+@group(0) @binding(8) var<storage, read_write> VB: array<u32>;
+@group(0) @binding(9) var hzb: texture_2d<f32>;
 fn emit(d: u32, k: u32) { let s = atomicAdd(&ARGS[d * 4u + 1u], 1u); VIS[u.base[d >> 2u][d & 3u] + s] = k; }
 fn inF(c: vec3f, r: f32) -> bool {
   for (var i = 0; i < 5; i++) { if (dot(u.pl[i].xyz, c) + u.pl[i].w < -r) { return false; } }
   return true;
 }
 fn d2(p: vec3f) -> f32 { let v = p.xz - u.cam.xz; return dot(v, v); }
+// is any of box lo-hi possibly in front of what phase 1 drew? (reversed depth: larger is nearer)
+fn seen(lo: vec3f, hi: vec3f) -> bool {
+  var mn = vec2f(1e9); var mx = vec2f(-1e9); var zn = 0.;
+  for (var i = 0u; i < 8u; i++) {
+    let p = select(lo, hi, vec3<bool>((i & 1u) != 0u, (i & 2u) != 0u, (i & 4u) != 0u));
+    let c = u.vp * vec4f(p, 1.);
+    if (c.w < .2) { return true; } // reaches the camera
+    let q = c.xy / c.w; mn = min(mn, q); mx = max(mx, q); zn = max(zn, c.z / c.w);
+  }
+  let a = max(vec2f(mn.x * .5 + .5, .5 - mx.y * .5) * u.hz.xy - 1., vec2f(0.));
+  let b = min(vec2f(mx.x * .5 + .5, .5 - mn.y * .5) * u.hz.xy + 1., u.hz.xy - 1.);
+  if (any(b < a)) { return false; }
+  // the pyramid level where the box spans at most 2x2 texels (level l texel = pixel / 2^(l + 1))
+  let top = i32(u.hz.z) - 1;
+  var l = clamp(i32(ceil(log2(max(max(b.x - a.x, b.y - a.y), 1.)))) - 1, 0, top);
+  var t0: vec2i; var t1: vec2i;
+  loop {
+    let s = exp2(f32(l + 1)); let dm = vec2i(textureDimensions(hzb, l)) - 1;
+    t0 = min(vec2i(a / s), dm); t1 = min(vec2i(b / s), dm);
+    if (all(t1 - t0 <= vec2i(1)) || l >= top) { break; }
+    l++;
+  }
+  var m = 1.;
+  for (var y = t0.y; y <= t1.y; y++) { for (var x = t0.x; x <= t1.x; x++) { m = min(m, textureLoad(hzb, vec2i(x, y), l).r); } }
+  return zn >= m;
+}
+// phase logic for object v (index into VB) about to be drawn by draw d as instance k, with bounds lo-hi
+fn pick(v: u32, d: u32, k: u32, lo: vec3f, hi: vec3f) {
+  let was = VB[v];
+  if (PHASE == 1u) { if (was != 0u) { emit(d, k); } return; }
+  let s = seen(lo, hi); VB[v] = u32(s);
+  if (s && was == 0u) { emit(d + 33u, k); }
+}
+fn gone(v: u32) { if (PHASE == 2u) { VB[v] = 0u; } }
 @compute @workgroup_size(64) fn cullT(@builtin(global_invocation_id) id: vec3u) {
   let k = id.x; if (k >= u.n.x) { return; }
   let lo = TB[k * 2u].xyz; let hi = TB[k * 2u + 1u].xyz; let c = (lo + hi) * .5; let h = (hi - lo) * .5;
-  let dx = max(abs(u.cam.xz - c.xz) - h.xz, vec2f(0.)); if (dot(dx, dx) > 240. * 240.) { return; }
-  for (var i = 0; i < 5; i++) { let p = u.pl[i]; if (dot(p.xyz, c) + dot(abs(p.xyz), h) + p.w < 0.) { return; } }
-  emit(0u, k);
+  let dx = max(abs(u.cam.xz - c.xz) - h.xz, vec2f(0.)); if (dot(dx, dx) > 240. * 240.) { gone(k); return; }
+  for (var i = 0; i < 5; i++) { let p = u.pl[i]; if (dot(p.xyz, c) + dot(abs(p.xyz), h) + p.w < 0.) { gone(k); return; } }
+  pick(k, 0u, k, lo, hi);
 }
 @compute @workgroup_size(64) fn cullS(@builtin(global_invocation_id) id: vec3u) {
   let k = id.x; if (k >= u.n.y) { return; }
   let cl = CLS[k]; if (cl >= 32u) { return; }
-  let s = SIB[k]; let C = u.cls[cl]; var m = u32(C.x);
+  let v = u.vo.x + k; let s = SIB[k]; let C = u.cls[cl]; var m = u32(C.x);
   if (C.z >= 0.) {
     let q = d2(s.a.xyz) / (u.cam.w * u.cam.w);
-    if (q >= C.w * C.w) { return; }
-    if (q >= C.z * C.z) { if (C.y < 0.) { return; } m = u32(C.y); }
+    if (q >= C.w * C.w) { gone(v); return; }
+    if (q >= C.z * C.z) { if (C.y < 0.) { gone(v); return; } m = u32(C.y); }
   }
-  if (!inF(s.a.xyz, s.a.w * u.rad[m >> 2u][m & 3u] + abs(s.c.w))) { return; }
-  emit(1u + m, k);
+  let r = s.a.w * u.rad[m >> 2u][m & 3u] + abs(s.c.w);
+  if (!inF(s.a.xyz, r)) { gone(v); return; }
+  pick(v, 1u + m, k, s.a.xyz - r, s.a.xyz + r);
 }
 @compute @workgroup_size(64) fn cullA(@builtin(global_invocation_id) id: vec3u) {
   let k = id.x; if (k >= u.n.z) { return; }
-  let s = AIB[k]; let fish = k < u.ln.z;
-  if (!inF(s.a.xyz, s.a.w + select(3. + s.b.z * 1.2, 5., fish))) { return; }
-  emit(select(28u, 27u, fish), k);
+  let v = u.vo.y + k; let s = AIB[k]; let fish = k < u.ln.z; let r = s.a.w + select(3. + s.b.z * 1.2, 5., fish);
+  if (!inF(s.a.xyz, r)) { gone(v); return; }
+  pick(v, select(28u, 27u, fish), k, s.a.xyz - r, s.a.xyz + r);
 }
 @compute @workgroup_size(64) fn cullL(@builtin(global_invocation_id) id: vec3u) {
   let k = id.x; if (k >= u.n.w) { return; }
-  let o = k * 9u; let a = bitcast<vec4f>(vec4u(LB[o], LB[o + 1u], LB[o + 2u], LB[o + 3u]));
+  let v = u.vo.z + k; let o = k * 9u; let a = bitcast<vec4f>(vec4u(LB[o], LB[o + 1u], LB[o + 2u], LB[o + 3u]));
   let q = d2(a.xyz) / (u.cam.w * u.cam.w);
   var d = 32u;
-  if (k < u.ln.x) { if (q < 24. * 24.) { d = 29u; } else if (q < 58. * 58.) { d = 30u; } else { return; } }
-  else if (k < u.ln.y) { if (q < 58. * 58. || q >= 150. * 150.) { return; } d = 31u; }
-  else if (q >= 70. * 70.) { return; }
-  if (!inF(a.xyz, a.w + 1.)) { return; }
-  emit(d, k);
+  if (k < u.ln.x) { if (q < 24. * 24.) { d = 29u; } else if (q < 58. * 58.) { d = 30u; } else { gone(v); return; } }
+  else if (k < u.ln.y) { if (q < 58. * 58. || q >= 150. * 150.) { gone(v); return; } d = 31u; }
+  else if (q >= 70. * 70.) { gone(v); return; }
+  // the blade's length, its width and how far the current sways it at its top (see sway(): .024 h^1.25 x 1.35)
+  let hA = bitcast<f32>(LB[o + 7u]); let wd = bitcast<f32>(LB[o + 6u]);
+  let r = a.w + wd + .5 + .0325 * pow(max(hA + a.w, 0.), 1.25);
+  if (!inF(a.xyz, r)) { gone(v); return; }
+  pick(v, d, k, a.xyz - r, a.xyz + r);
+}
+`;
+
+// depth pyramid for the occlusion test: level 0 = the farthest depth of each 2x2 pixels, each next level the farthest
+// of the 3x3 texels below it (3, not 2: a level of odd size has a row or column more than twice the next)
+const W_HZB = /*wgsl*/`
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var dst: texture_storage_2d<r32float, write>;
+@group(0) @binding(2) var dep: texture_depth_2d;
+@compute @workgroup_size(8, 8) fn mip0(@builtin(global_invocation_id) id: vec3u) {
+  if (any(id.xy >= textureDimensions(dst))) { return; }
+  let s = vec2i(id.xy) * 2; let mx = vec2i(textureDimensions(dep)) - 1;
+  let m = min(min(textureLoad(dep, min(s, mx), 0), textureLoad(dep, min(s + vec2i(1, 0), mx), 0)),
+              min(textureLoad(dep, min(s + vec2i(0, 1), mx), 0), textureLoad(dep, min(s + vec2i(1, 1), mx), 0)));
+  textureStore(dst, id.xy, vec4f(m));
+}
+@compute @workgroup_size(8, 8) fn mipN(@builtin(global_invocation_id) id: vec3u) {
+  if (any(id.xy >= textureDimensions(dst))) { return; }
+  let s = vec2i(id.xy) * 2; let mx = vec2i(textureDimensions(src)) - 1; var m = 1.;
+  for (var y = 0; y < 3; y++) { for (var x = 0; x < 3; x++) { m = min(m, textureLoad(src, min(s + vec2i(x, y), mx), 0).r); } }
+  textureStore(dst, id.xy, vec4f(m));
 }
 `;
 
